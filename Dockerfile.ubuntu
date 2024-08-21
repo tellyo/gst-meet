@@ -1,0 +1,63 @@
+FROM ubuntu:24.10
+ENV GSTREAMER_VERSION=1.24.5
+ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
+
+RUN apt-get update && \
+    apt-get install -y \
+      bison \
+      build-essential \
+      bzip2 \
+      clang \
+      cmake \
+      curl \
+      flex \
+      gcc \
+      git \
+      llvm-dev \
+      libclang-dev \
+      libnice-dev \
+      librust-bindgen-dev \
+      libssl-dev \
+      meson \
+      nasm \
+      ninja-build \
+      openssl \
+      pkg-config
+
+WORKDIR /aom
+RUN git clone https://aomedia.googlesource.com/aom . && \
+    git checkout v3.9.1 && \
+    mkdir build_aom && \
+    cd build_aom && \
+    cmake -DBUILD_SHARED_LIBS=1 .. && \
+    make -j$(nproc) && \
+    make install
+
+WORKDIR /x264
+RUN git clone https://code.videolan.org/videolan/x264.git . && \
+    ./configure --prefix="/usr/local" --enable-shared --enable-static --enable-pic && \
+    make -j$(nproc) && \
+    make install
+
+WORKDIR /gst
+RUN git clone https://gitlab.freedesktop.org/gstreamer/gstreamer.git . && \
+    git checkout ${GSTREAMER_VERSION} && \
+    meson build --wipe --prefix=/usr/local -Dgst-plugins-bad:aom=enabled -Dgst-plugins-ugly:x264=enabled -Dgpl=enabled -Dgst-plugins-bad:nvcodec=enabled && \
+    ninja -C build install
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o rust.sh && \
+  sh rust.sh -y
+
+ENV PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+RUN cargo install --force --locked bindgen-cli
+
+WORKDIR /gst-plugins-rs
+RUN cargo install cargo-c && \
+    git clone https://github.com/sdroege/gst-plugin-rs.git . && \
+    cargo build -p gst-plugin-rtp && \
+    cp target/debug/libgstrsrtp.so /usr/local/lib/x86_64-linux-gnu/gstreamer-1.0
+
+WORKDIR /gst-meet
+COPY . .
+RUN cargo build --release -p gst-meet

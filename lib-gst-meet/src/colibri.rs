@@ -27,6 +27,7 @@ const CONNECT_RETRY_SLEEP: Duration = Duration::from_secs(3);
 pub(crate) struct ColibriChannel {
   send_tx: mpsc::Sender<ColibriMessage>,
   recv_tx: Arc<Mutex<Vec<mpsc::Sender<ColibriMessage>>>>,
+  error_tx: Arc<Mutex<Vec<mpsc::Sender<()>>>>,
 }
 
 impl ColibriChannel {
@@ -129,9 +130,20 @@ impl ColibriChannel {
       Ok::<_, anyhow::Error>(())
     });
 
+    let error_tx: Arc<Mutex<Vec<mpsc::Sender<()>>>> = Arc::new(Mutex::new(vec![]));
+    let moved_error_tx = error_tx.clone();
     tokio::spawn(async move {
       tokio::select! {
         res = recv_task => if let Ok(Err(e)) = res {
+          let error_tx = moved_error_tx.clone();
+          let mut exs = error_tx.lock().await;
+          let exs_clone = exs.clone();
+          for (i, tx) in exs_clone.iter().enumerate().rev() {
+            if tx.send(()).await.is_err() {
+              debug!("colibri error subscriber closed, removing");
+              exs.remove(i);
+            }
+          }
           error!("colibri recv loop: {:?}", e);
         },
         res = send_task => if let Ok(Err(e)) = res {
@@ -140,7 +152,7 @@ impl ColibriChannel {
       };
     });
 
-    Ok(Self { send_tx, recv_tx })
+    Ok(Self { send_tx, recv_tx, error_tx })
   }
 
   pub(crate) async fn subscribe(&self, tx: mpsc::Sender<ColibriMessage>) {
@@ -151,4 +163,11 @@ impl ColibriChannel {
     self.send_tx.send(msg).await?;
     Ok(())
   }
+  
+  pub(crate) async fn subscribe_to_recv_error(&self, tx: mpsc::Sender<()>) -> Result<()> {
+    self.error_tx.lock().await.push(tx);
+
+    Ok(())
+  }
+
 }

@@ -14,7 +14,7 @@ use lib_gst_meet::{
   init_tracing, Authentication, Connection, JitsiConference, JitsiConferenceConfig, MediaType,
 };
 use structopt::StructOpt;
-use tokio::{signal::ctrl_c, task, time::timeout};
+use tokio::{signal::ctrl_c, task, time::timeout, sync::mpsc};
 use tracing::{error, info, trace, warn};
 
 #[derive(Debug, Clone, StructOpt)]
@@ -518,6 +518,84 @@ async fn main_inner() -> Result<()> {
     main_loop_.quit();
   });
 
+  let conference2 = conference.clone();
+  let main_loop2 = main_loop.clone();
+  tokio::spawn(async move {
+    let (tx, mut rx) = mpsc::channel::<()>(1);
+
+    match conference2.subscribe_to_colibri_recv_error(tx).await {
+      Ok(()) => {},
+      Err(e) => error!("{:?}", e)
+    }
+
+    rx.recv().await;
+
+    info!("Exiting cause colibri error...");
+
+    match timeout(Duration::from_secs(10), conference2.leave()).await {
+      Ok(Ok(_)) => {},
+      Ok(Err(e)) => warn!("Error leaving conference: {:?}", e),
+      Err(_) => warn!("Timed out leaving conference"),
+    }
+
+    main_loop2.quit();
+  });
+/*
+  let conference2 = conference.clone();
+  let conference3 = conference.clone();
+  let main_loop__ = main_loop.clone();
+
+  tokio::spawn(async move {
+    let _ = conference2.pipeline_stopped().await;
+    
+    error!("Pipeline stopped, exiting...");
+
+    match timeout(Duration::from_secs(10), conference3.leave()).await {
+      Ok(Ok(_)) => {},
+      Ok(Err(e)) => warn!("Error leaving conference: {:?}", e),
+      Err(_) => warn!("Timed out leaving conference"),
+    }
+
+    main_loop__.quit();
+  });
+*/
+/*
+  let bus = conference.pipeline().await.unwrap().bus().context("failed to get pipeline bus")?;
+
+  tokio::spawn(async move {
+    let mut stream = bus.stream();
+
+    while let Some(msg) = stream.next().await {
+        match msg.view() {
+          gstreamer::MessageView::Error(e) => {
+            if let Some(d) = e.debug() {
+              error!("{}", d);
+            }
+          },
+          gstreamer::MessageView::Warning(e) => {
+            if let Some(d) = e.debug() {
+              warn!("{}", d);
+            }
+          },
+          gstreamer::MessageView::StateChanged(state)
+            if state.current() == gstreamer::State::Null =>
+          {
+            warn!("pipeline state is null. terminating...");
+            //break;
+          },
+          _ => {},
+        }
+    }
+
+    match timeout(Duration::from_secs(10), conference__.leave()).await {
+      Ok(Ok(_)) => {},
+      Ok(Err(e)) => warn!("Error leaving conference: {:?}", e),
+      Err(_) => warn!("Timed out leaving conference"),
+    }
+
+    main_loop__.quit();
+  });
+*/
   task::spawn_blocking(move || main_loop.run()).await?;
 
   Ok(())

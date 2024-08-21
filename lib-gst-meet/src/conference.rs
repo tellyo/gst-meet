@@ -410,6 +410,20 @@ impl JitsiConference {
     self.inner.lock().await.send_resolution = Some(height);
   }
 
+  pub async fn subscribe_to_colibri_recv_error(&self, tx: mpsc::Sender<()>) -> Result<()> {
+    self
+      .jingle_session
+      .lock()
+      .await
+      .as_ref()
+      .context("not connected (no jingle session)")?
+      .colibri_channel
+      .as_ref()
+      .context("no colibri channel")?
+      .subscribe_to_recv_error(tx)
+      .await
+  }
+
   pub async fn send_colibri_message(&self, message: ColibriMessage) -> Result<()> {
     self
       .jingle_session

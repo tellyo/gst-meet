@@ -1151,8 +1151,15 @@ impl JingleSession {
     else {
       bail!("unsupported video codec: {}", codec_name);
     };
-    video_sink_element.set_property("ssrc", video_ssrc);
-    //video_sink_element.set_property("ssrc", video_ssrc as i64);
+
+    if let Some(codec) = codec {
+      if codec.name == CodecName::Av1 {
+        video_sink_element.set_property("ssrc", video_ssrc as i64);
+      } else {
+        video_sink_element.set_property("ssrc", video_ssrc);
+      }
+    }
+
     if video_sink_element.has_property("auto-header-extension", None) {
       video_sink_element.set_property("auto-header-extension", false);
       video_sink_element.connect("request-extension", false, move |values| {

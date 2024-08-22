@@ -1152,11 +1152,19 @@ impl JingleSession {
       bail!("unsupported video codec: {}", codec_name);
     };
 
-    if let Some(codec) = codec {
-      if codec.name == CodecName::Av1 {
-        video_sink_element.set_property("ssrc", video_ssrc as i64);
-      } else {
-        video_sink_element.set_property("ssrc", video_ssrc);
+    if let Some(pspec) = video_sink_element.find_property("ssrc") {
+      match pspec.value_type() {
+        glib::Type::I64 => {
+          video_sink_element.set_property("ssrc", video_ssrc as i64);
+        }
+        glib::Type::U32 => {
+          video_sink_element.set_property("ssrc", video_ssrc);
+        }
+        _ => {
+          warn!(
+              "Unsupported ssrc type of the rtp payloader (expected i64 or u32)"
+          );
+        }
       }
     }
 

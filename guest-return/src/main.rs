@@ -123,6 +123,8 @@ struct Opt {
   )]
   conference_url: String,
 
+  #[structopt(long)]
+  stereo: Option<bool>,
 }
 
 #[cfg(target_os = "macos")]
@@ -165,6 +167,14 @@ struct GuestReturn {
   send_pipeline: Option<String>,
   buffer_size: u32,
   websocket_uri: Uri,
+  stereo: Option<bool>,
+}
+
+struct RoomDetails {
+  conferenceName: String,
+  prettyConferenceName: String,
+  shortenedIds: Option<Vec<String>>,
+  hqAudio: Option<bool>,
 }
 
 fn init_gstreamer() -> Result<()> {
@@ -191,6 +201,7 @@ async fn main_inner() -> Result<()> {
       send_pipeline: opt.send_pipeline,
       buffer_size: opt.buffer_size,
       websocket_uri: Uri::default(),
+      stereo: opt.stereo,
     };
     
     let conference_domain = match opt.conference_url.parse::<Uri>()?.into_parts().authority {
@@ -321,6 +332,18 @@ async fn start_guest(config: GuestReturn) -> Result<()> {
     config.room_name,
     config.muc_domain
    );
+
+   let stereo = match config.stereo {
+    Some(x) => x,
+    None => {
+      info!("Stereo not provided, obtaining value from backend");
+      let url = format!("{}/room/{}", config.conference_url, config.room_name);
+      let response = reqwest::get(url).await?.json::<RoomDetails>().await?;
+      let stereo = response.hqAudio.unwrap_or(false);
+      info!("Stereo value from backend: {}", stereo);
+      stereo
+    },
+   };
 
    let config = JitsiConferenceConfig{
     muc: room_jid.parse()?,

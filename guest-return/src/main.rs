@@ -154,6 +154,7 @@ fn main() {
 
 #[derive(Debug)]
 struct GuestReturn {
+  conference_url: String,
   room_name: String,
   xmpp_domain: String,
   muc_domain: String,
@@ -189,6 +190,7 @@ async fn main_inner() -> Result<()> {
     let opt = Opt::from_args();
 
     let mut config = GuestReturn{
+      conference_url: opt.conference_url,
       room_name: opt.room_name,
       xmpp_domain: opt.xmpp_domain,
       muc_domain: opt.muc_domain,

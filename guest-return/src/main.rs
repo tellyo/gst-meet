@@ -341,7 +341,7 @@ async fn start_guest(config: GuestReturn) -> Result<()> {
     Some(x) => x,
     None => {
       info!("Stereo not provided, obtaining value from backend");
-      let url = format!("{}/room/{}", config.conference_url, config.room_name);
+      let url = format!("{}/roomdetails/{}", config.conference_url, config.room_name);
       let response = reqwest::get(url).await?.json::<RoomDetails>().await?;
       let stereo = response.hqAudio.unwrap_or(false);
       info!("Stereo value from backend: {}", stereo);

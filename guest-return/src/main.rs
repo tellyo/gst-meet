@@ -170,6 +170,7 @@ struct GuestReturn {
   stereo: Option<bool>,
 }
 
+#[derive(Serialize, Deserialize,Debug,Clone)]
 struct RoomDetails {
   conferenceName: String,
   prettyConferenceName: String,

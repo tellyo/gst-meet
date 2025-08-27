@@ -208,7 +208,7 @@ async fn main_inner() -> Result<()> {
       stereo: opt.stereo,
     };
     
-    let conference_domain = match opt.conference_url.parse::<Uri>()?.into_parts().authority {
+    let conference_domain = match opt.conference_url.clone().parse::<Uri>()?.into_parts().authority {
       Some(x) => x,
       None => return Err(anyhow!("Invalid conference url: {}: Should be in format https://conference.tellyo.com", opt.conference_url)),
     };

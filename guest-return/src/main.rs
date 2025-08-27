@@ -357,7 +357,7 @@ async fn start_guest(config: GuestReturn) -> Result<()> {
     video_codec: config.video_codec,
     extra_muc_features: vec![],
     start_bitrate: 800,
-    stereo: false,
+    stereo: stereo,
     recv_video_scale_height: recv_video_scale_height,
     recv_video_scale_width: recv_video_scale_width,
     buffer_size: config.buffer_size,

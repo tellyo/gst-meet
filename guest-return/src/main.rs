@@ -191,7 +191,7 @@ async fn main_inner() -> Result<()> {
     let opt = Opt::from_args();
 
     let mut config = GuestReturn{
-      conference_url: opt.conference_url,
+      conference_url: opt.conference_url.clone(),
       room_name: opt.room_name,
       xmpp_domain: opt.xmpp_domain,
       muc_domain: opt.muc_domain,

@@ -58,6 +58,6 @@ RUN cargo install cargo-c && \
     cargo build -p gst-plugin-rtp && \
     cp target/debug/libgstrsrtp.so /usr/local/lib/x86_64-linux-gnu/gstreamer-1.0
 
-WORKDIR /gst-meet
+WORKDIR /guest-return
 COPY . .
-RUN cargo build --release -p gst-meet
+RUN cargo build --release -p guest-return

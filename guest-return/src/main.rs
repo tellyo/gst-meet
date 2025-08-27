@@ -21,6 +21,7 @@ use lib_gst_meet::{
     init_tracing, Authentication, Connection, JitsiConference, JitsiConferenceConfig, MediaType,
   };
 use colibri::{ColibriMessage, Constraints, VideoType};
+use serde::{Deserialize, Serialize};
 
 #[cfg(not(target_os = "macos"))]
 #[tokio::main]

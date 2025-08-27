@@ -1,0 +1,15 @@
+#!/usr/bin/env sh
+
+set -e
+
+if [ "${#}" -eq "0" ]; then
+  set -- /usr/bin/guest-return
+else
+  # if first arg starts with - sign, we treat it like cmdline argument
+  # and put the bin name at the beginning
+  if [ "${1#-}" != "$1" ]; then
+    set -- /usr/bin/guest-return "${@}"
+  fi
+fi
+
+exec "${@}"

@@ -7,5 +7,6 @@ members = [
   "nice-gst-meet",
   "nice-gst-meet-sys",
   "jitsi-xmpp-parsers",
+  "guest-return",
 ]
 

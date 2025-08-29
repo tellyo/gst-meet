@@ -21,6 +21,7 @@ use lib_gst_meet::{
     init_tracing, Authentication, Connection, JitsiConference, JitsiConferenceConfig, MediaType,
   };
 use colibri::{ColibriMessage, Constraints, VideoType};
+use serde::{Deserialize, Serialize};
 
 #[cfg(not(target_os = "macos"))]
 #[tokio::main]
@@ -123,6 +124,8 @@ struct Opt {
   )]
   conference_url: String,
 
+  #[structopt(long)]
+  stereo: Option<bool>,
 }
 
 #[cfg(target_os = "macos")]
@@ -152,6 +155,7 @@ fn main() {
 
 #[derive(Debug)]
 struct GuestReturn {
+  conference_url: String,
   room_name: String,
   xmpp_domain: String,
   muc_domain: String,
@@ -165,6 +169,15 @@ struct GuestReturn {
   send_pipeline: Option<String>,
   buffer_size: u32,
   websocket_uri: Uri,
+  stereo: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize,Debug,Clone)]
+struct RoomDetails {
+  conferenceName: String,
+  prettyConferenceName: String,
+  shortenedIds: Option<Vec<String>>,
+  hqAudio: Option<bool>,
 }
 
 fn init_gstreamer() -> Result<()> {
@@ -178,6 +191,7 @@ async fn main_inner() -> Result<()> {
     let opt = Opt::from_args();
 
     let mut config = GuestReturn{
+      conference_url: opt.conference_url.clone(),
       room_name: opt.room_name,
       xmpp_domain: opt.xmpp_domain,
       muc_domain: opt.muc_domain,
@@ -191,9 +205,10 @@ async fn main_inner() -> Result<()> {
       send_pipeline: opt.send_pipeline,
       buffer_size: opt.buffer_size,
       websocket_uri: Uri::default(),
+      stereo: opt.stereo,
     };
     
-    let conference_domain = match opt.conference_url.parse::<Uri>()?.into_parts().authority {
+    let conference_domain = match opt.conference_url.clone().parse::<Uri>()?.into_parts().authority {
       Some(x) => x,
       None => return Err(anyhow!("Invalid conference url: {}: Should be in format https://conference.tellyo.com", opt.conference_url)),
     };
@@ -322,6 +337,18 @@ async fn start_guest(config: GuestReturn) -> Result<()> {
     config.muc_domain
    );
 
+   let stereo = match config.stereo {
+    Some(x) => x,
+    None => {
+      info!("Stereo not provided, obtaining value from backend");
+      let url = format!("{}/roomdetails/{}", config.conference_url, config.room_name);
+      let response = reqwest::get(url).await?.json::<RoomDetails>().await?;
+      let stereo = response.hqAudio.unwrap_or(false);
+      info!("Stereo value from backend: {}", stereo);
+      stereo
+    },
+   };
+
    let config = JitsiConferenceConfig{
     muc: room_jid.parse()?,
     focus: config.focus_jid.parse()?,
@@ -330,7 +357,7 @@ async fn start_guest(config: GuestReturn) -> Result<()> {
     video_codec: config.video_codec,
     extra_muc_features: vec![],
     start_bitrate: 800,
-    stereo: false,
+    stereo: stereo,
     recv_video_scale_height: recv_video_scale_height,
     recv_video_scale_width: recv_video_scale_width,
     buffer_size: config.buffer_size,

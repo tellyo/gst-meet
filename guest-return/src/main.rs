@@ -173,11 +173,19 @@ struct GuestReturn {
 }
 
 #[derive(Serialize, Deserialize,Debug,Clone)]
+#[serde(rename_all = "camelCase")]
 struct RoomDetails {
-  conferenceName: String,
-  prettyConferenceName: String,
-  shortenedIds: Option<Vec<String>>,
-  hqAudio: Option<bool>,
+  #[serde(default)]
+  conference_name: String,
+
+  #[serde(default)]
+  pretty_conference_name: String,
+
+  #[serde(default)]
+  shortened_ids: Option<Vec<String>>,
+
+  #[serde(default)]
+  hq_audio: Option<bool>,
 }
 
 fn init_gstreamer() -> Result<()> {

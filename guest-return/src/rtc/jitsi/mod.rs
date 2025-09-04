@@ -87,8 +87,6 @@ pub struct Invitation {
     restrictions: Vec<String>,
 }
 
-
-
 pub struct Jitsi {
     http_client: reqwest::Client,
     env: String,

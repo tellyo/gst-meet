@@ -376,6 +376,7 @@ async fn start_guest(config: GuestReturn) -> Result<()> {
           error!("API Error: {} (status: {})", error.details, error.status);
         }
 
+        // there's no room with this ID, sleep for 10 seconds and exit app
         sleep(Duration::from_secs(10)).await;
         return Err(anyhow::anyhow!("Failed to get room details from backend"));
       } else {

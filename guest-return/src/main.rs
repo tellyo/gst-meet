@@ -188,6 +188,18 @@ struct RoomDetails {
   hq_audio: Option<bool>,
 }
 
+//{"errors":[{"details":"room not found","status":404}]}
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct JsonApiErrors {
+  errors: Vec<JsonApiError>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct JsonApiError {
+  details: String,
+  status: u32,
+}
+
 fn init_gstreamer() -> Result<()> {
     trace!("starting gstreamer init");
     gstreamer::init()?;
@@ -350,10 +362,25 @@ async fn start_guest(config: GuestReturn) -> Result<()> {
     None => {
       info!("Stereo not provided, obtaining value from backend");
       let url = format!("{}/roomdetails/{}", config.conference_url, config.room_name);
-      let response = reqwest::get(url).await?.json::<RoomDetails>().await?;
-      let stereo = response.hqAudio.unwrap_or(false);
-      info!("Stereo value from backend: {}", stereo);
-      stereo
+      let response = reqwest::get(url).await?;
+      let response_text = response.text().await?;
+      
+      // Try to parse as RoomDetails first
+      if let Ok(room_details) = serde_json::from_str::<RoomDetails>(&response_text) {
+        let stereo = room_details.hq_audio.unwrap_or(false);
+        info!("Stereo value from backend: {}", stereo);
+        stereo
+      } else if let Ok(json_errors) = serde_json::from_str::<JsonApiErrors>(&response_text) {
+        // Handle JsonApiErrors
+        for error in json_errors.errors {
+          error!("API Error: {} (status: {})", error.details, error.status);
+        }
+
+        sleep(Duration::from_secs(10)).await;
+        return Err(anyhow::anyhow!("Failed to get room details from backend"));
+      } else {
+        return Err(anyhow::anyhow!("Failed to parse response from backend"));
+      }
     },
    };
 

@@ -603,9 +603,9 @@ fn generate_gst_pipeline_string(codec: String, ip_video: String, port_video: Str
   match codec.as_str() {
     "h264" => {
   format!("rtpbin name=return_rtpbin
-    udpsrc reuse=true address=localhost port=5034 caps=\"application/x-rtp, media=video, clock-rate=90000, encoding-name=H264, rtcp-fb-nack=1, rtcp-fb-nack-pli=(int)1, rtcp-fb-ccm-fir=1, payload=96\" ! return_rtpbin.recv_rtp_sink_0
+    udpsrc reuse=true address={ip_video} port={port_video} caps=\"application/x-rtp, media=video, clock-rate=90000, encoding-name=H264, rtcp-fb-nack=1, rtcp-fb-nack-pli=(int)1, rtcp-fb-ccm-fir=1, payload=96\" ! return_rtpbin.recv_rtp_sink_0
     return_rtpbin. ! identity name=pli-injector ! rtph264depay ! h264parse config-interval=-1 ! queue name=video
-    udpsrc reuse=true address=localhost port=5035 ! identity name=rtcp_logger_receiver ! return_rtpbin.recv_rtcp_sink_0
+    udpsrc reuse=true address={ip_video} port=5035 ! identity name=rtcp_logger_receiver ! return_rtpbin.recv_rtcp_sink_0
     return_rtpbin.send_rtcp_src_0 ! identity name=rtcp_logger_sender ! udpsink host=localhost port=5036 sync=false async=false
     jackaudiosrc connect=0 client-name={audio_source} !
     queue !

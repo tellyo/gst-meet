@@ -836,14 +836,18 @@ dependencies = [
  "cocoa",
  "colibri",
  "futures",
+ "futures-util",
  "glib",
  "gstreamer",
  "http",
  "lib-gst-meet",
+ "serde",
+ "serde_json",
  "serde_urlencoded",
  "structopt",
  "tokio",
  "tokio-stream",
+ "tokio-tungstenite",
  "tracing",
 ]
 
@@ -943,6 +947,29 @@ dependencies = [
  "structopt",
  "tokio",
  "tokio-stream",
+ "tracing",
+]
+
+[[package]]
+name = "guest-simulator"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "cocoa",
+ "colibri",
+ "futures",
+ "futures-util",
+ "glib",
+ "gstreamer",
+ "http",
+ "lib-gst-meet",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "structopt",
+ "tokio",
+ "tokio-stream",
+ "tokio-tungstenite",
  "tracing",
 ]
 

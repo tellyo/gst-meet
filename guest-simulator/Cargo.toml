@@ -1,5 +1,5 @@
 [package]
-name = "gst-meet"
+name = "guest-simulator"
 description = "A tool for connecting GStreamer pipelines to Jitsi Meet conferences"
 version = "0.5.0"
 edition = "2021"

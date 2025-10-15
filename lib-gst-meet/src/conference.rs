@@ -287,7 +287,7 @@ impl JitsiConference {
     Ok(())
   }
 
-  pub(crate) fn endpoint_id(&self) -> Result<&str> {
+  pub fn endpoint_id(&self) -> Result<&str> {
     endpoint_id_for_jid(&self.jid)
   }
 

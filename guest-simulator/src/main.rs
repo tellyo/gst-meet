@@ -583,10 +583,10 @@ async fn main_inner() -> Result<()> {
     };
     
     // Connect to WebSocket
-    let ws_url = "wss://conference-dev.tellyo.com/new-notify-ws";
-    let (mut ws_sink, mut ws_stream) = match connect_async(ws_url).await {
+    let ws_url = format!("wss://conference-dev.tellyo.com/notify-ws?token={}", opt.token);
+    let (mut ws_sink, mut ws_stream) = match connect_async(ws_url.clone()).await {
       Ok((ws_stream, _)) => {
-        info!("Connected to WebSocket at {}", ws_url);
+        info!("Connected to WebSocket at {}", ws_url.clone());
         ws_stream.split()
       }
       Err(e) => {

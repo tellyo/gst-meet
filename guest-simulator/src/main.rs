@@ -671,7 +671,7 @@ async fn main_inner() -> Result<()> {
         // Send periodic messages
         _ = interval.tick() => {
           let message = StatsUpdateMessage {
-            message_type: "statsUpdate".to_string(),
+            message_type: "STATS_UPDATE".to_string(),
             data: UserStats {
               audio: false,
               connection_quality: 100.0,

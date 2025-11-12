@@ -58,7 +58,13 @@ struct UpdateEndpointIdData {
 struct StatsUpdateMessage {
     #[serde(rename = "type")]
     message_type: String,
-    data: UserStats,
+    data: StatsUpdateData,
+}
+
+#[derive(Debug, Serialize)]
+struct StatsUpdateData {
+  token: String,
+  stats: UserStats,
 }
 
 #[derive(Debug, Serialize)]
@@ -672,17 +678,20 @@ async fn main_inner() -> Result<()> {
         _ = interval.tick() => {
           let message = StatsUpdateMessage {
             message_type: "STATS_UPDATE".to_string(),
-            data: UserStats {
-              audio: false,
-              connection_quality: 100.0,
-              endpoint_id: endpoint_id.clone(),
-              is_production_muted: false,
-              name: nick.clone(),
-              room: opt.room_name.clone(),
-              screenshare: false,
-              status: "active".to_string(),
-              video: true,
-              vssrc: 0,
+            data: StatsUpdateData {
+              token: opt.token.clone(),
+              stats: UserStats {
+                audio: false,
+                connection_quality: 100.0,
+                endpoint_id: endpoint_id.clone(),
+                is_production_muted: false,
+                name: nick.clone(),
+                room: opt.room_name.clone(),
+                screenshare: false,
+                status: "active".to_string(),
+                video: true,
+                vssrc: 0,
+              }
             },
           };
           let message = Message::Text(serde_json::to_string(&message).unwrap());

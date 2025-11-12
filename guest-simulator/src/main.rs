@@ -39,6 +39,42 @@ struct InitData {
     token: String,
 }
 
+#[derive(Debug, Serialize)]
+struct UpdateEndpointIdMessage {
+    #[serde(rename = "type")]
+    message_type: String,
+    data: UpdateEndpointIdData,
+}
+
+#[derive(Debug, Serialize)]
+struct UpdateEndpointIdData {
+    #[serde(rename = "endpointId")]
+    endpoint_id: String,
+    token: String,
+    force: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct StatsUpdateMessage {
+    #[serde(rename = "type")]
+    message_type: String,
+    data: UserStats,
+}
+
+#[derive(Debug, Serialize)]
+struct UserStats {
+  audio: bool,
+  connection_quality: f64,
+  endpoint_id: String,
+  is_production_muted: bool,
+  name: String,
+  room: String,
+  screenshare: bool,
+  status: String,
+  video: bool,
+  vssrc: i64,
+}
+
 #[derive(Debug, Clone, StructOpt)]
 #[structopt(
   name = "gst-meet",
@@ -341,7 +377,7 @@ async fn main_inner() -> Result<()> {
   let config = JitsiConferenceConfig {
     muc: room_jid.parse()?,
     focus: focus_jid.parse()?,
-    nick,
+    nick: nick.clone(),
     region,
     video_codec,
     extra_muc_features: vec![],
@@ -567,6 +603,7 @@ async fn main_inner() -> Result<()> {
   });
 
   let conference3 = conference.clone();
+  let nick = nick.clone();
   tokio::spawn(async move {
     // Wait until endpoint ID is available
     let endpoint_id = loop {
@@ -602,7 +639,7 @@ async fn main_inner() -> Result<()> {
         mic: false,
         camera: true,
         room: opt.room_name.clone(),
-        display_name: "Alek1".to_string(),
+        display_name: nick.clone().to_string(),
         endpoint_id: endpoint_id.clone(),
         token: opt.token.clone(),
       },
@@ -633,12 +670,27 @@ async fn main_inner() -> Result<()> {
       tokio::select! {
         // Send periodic messages
         _ = interval.tick() => {
-          let message = Message::Text(json_message.clone());
+          let message = StatsUpdateMessage {
+            message_type: "statsUpdate".to_string(),
+            data: UserStats {
+              audio: false,
+              connection_quality: 100.0,
+              endpoint_id: endpoint_id.clone(),
+              is_production_muted: false,
+              name: nick.clone(),
+              room: opt.room_name.clone(),
+              screenshare: false,
+              status: "active".to_string(),
+              video: true,
+              vssrc: 0,
+            },
+          };
+          let message = Message::Text(serde_json::to_string(&message).unwrap());
           if let Err(e) = ws_sink.send(message).await {
-            error!("Failed to send periodic WebSocket message: {}", e);
+            error!("Failed to send update endpoint ID message: {}", e);
             break;
           }
-          trace!("Sent periodic init message with endpoint ID {} to WebSocket", endpoint_id);
+          trace!("Sent update endpoint ID message with endpoint ID {} to WebSocket", endpoint_id);
         }
         
         // Handle incoming messages (optional - just to keep connection alive)

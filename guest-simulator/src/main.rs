@@ -610,122 +610,132 @@ async fn main_inner() -> Result<()> {
 
   let conference3 = conference.clone();
   let nick = nick.clone();
+  let token = opt.token.clone();
+  let room_name = opt.room_name.clone();
   tokio::spawn(async move {
-    // Wait until endpoint ID is available
-    let endpoint_id = loop {
-      match conference3.endpoint_id() {
-        Ok(id) => {
-          info!("Endpoint ID available: {}", id);
-          break id.to_string();
-        }
-        Err(_) => {
-          trace!("Waiting for endpoint ID to be available...");
-          tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-      }
-    };
-    
-    // Connect to WebSocket
-    let ws_url = format!("wss://conference-dev.tellyo.com/notify-ws?token={}", opt.token);
-    let (mut ws_sink, mut ws_stream) = match connect_async(ws_url.clone()).await {
-      Ok((ws_stream, _)) => {
-        info!("Connected to WebSocket at {}", ws_url.clone());
-        ws_stream.split()
-      }
-      Err(e) => {
-        error!("Failed to connect to WebSocket at {}: {}", ws_url, e);
-        return;
-      }
-    };
-    
-    // Create the JSON message
-    let message = InitMessage {
-      message_type: "init".to_string(),
-      data: InitData {
-        mic: false,
-        camera: true,
-        room: opt.room_name.clone(),
-        display_name: nick.clone().to_string(),
-        endpoint_id: endpoint_id.clone(),
-        token: opt.token.clone(),
-      },
-    };
-    
-    // Serialize to JSON
-    let json_message = match serde_json::to_string(&message) {
-      Ok(json) => json,
-      Err(e) => {
-        error!("Failed to serialize init message: {}", e);
-        return;
-      }
-    };
-    
-    // Set up interval for sending messages every second
-    let mut interval = interval(Duration::from_secs(1));
-    
-    // Send initial message
-    let message = Message::Text(json_message.clone());
-    if let Err(e) = ws_sink.send(message).await {
-      error!("Failed to send initial WebSocket message: {}", e);
-      return;
-    }
-    info!("Sent initial init message with endpoint ID {} to WebSocket", endpoint_id);
-    
-    // Keep connection alive and send periodic messages
     loop {
-      tokio::select! {
-        // Send periodic messages
-        _ = interval.tick() => {
-          let message = StatsUpdateMessage {
-            message_type: "STATS_UPDATE".to_string(),
-            data: StatsUpdateData {
-              token: opt.token.clone(),
-              stats: UserStats {
-                audio: false,
-                connection_quality: 100.0,
-                endpoint_id: endpoint_id.clone(),
-                is_production_muted: false,
-                name: nick.clone(),
-                room: opt.room_name.clone(),
-                screenshare: false,
-                status: "active".to_string(),
-                video: true,
-                vssrc: 0,
-              }
-            },
-          };
-          let message = Message::Text(serde_json::to_string(&message).unwrap());
-          if let Err(e) = ws_sink.send(message).await {
-            error!("Failed to send update endpoint ID message: {}", e);
-            break;
+      // Wait until endpoint ID is available
+      let endpoint_id = loop {
+        match conference3.endpoint_id() {
+          Ok(id) => {
+            info!("Endpoint ID available: {}", id);
+            break id.to_string();
           }
-          trace!("Sent update endpoint ID message with endpoint ID {} to WebSocket", endpoint_id);
+          Err(_) => {
+            trace!("Waiting for endpoint ID to be available...");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+          }
         }
-        
-        // Handle incoming messages (optional - just to keep connection alive)
-        msg = ws_stream.next() => {
-          match msg {
-            Some(Ok(Message::Close(_))) => {
-              info!("WebSocket connection closed by server");
+      };
+      
+      // Connect to WebSocket
+      let ws_url = format!("wss://conference-dev.tellyo.com/notify-ws?token={}", token);
+      let (mut ws_sink, mut ws_stream) = match connect_async(ws_url.clone()).await {
+        Ok((ws_stream, _)) => {
+          info!("Connected to WebSocket at {}", ws_url.clone());
+          ws_stream.split()
+        }
+        Err(e) => {
+          error!("Failed to connect to WebSocket at {}: {}", ws_url, e);
+          tokio::time::sleep(Duration::from_secs(1)).await;
+          continue;
+        }
+      };
+      
+      // Create the JSON message
+      let message = InitMessage {
+        message_type: "init".to_string(),
+        data: InitData {
+          mic: false,
+          camera: true,
+          room: room_name.clone(),
+          display_name: nick.clone().to_string(),
+          endpoint_id: endpoint_id.clone(),
+          token: token.clone(),
+        },
+      };
+      
+      // Serialize to JSON
+      let json_message = match serde_json::to_string(&message) {
+        Ok(json) => json,
+        Err(e) => {
+          error!("Failed to serialize init message: {}", e);
+          tokio::time::sleep(Duration::from_secs(1)).await;
+          continue;
+        }
+      };
+      
+      // Set up interval for sending messages every second
+      let mut interval = interval(Duration::from_secs(1));
+      
+      // Send initial message
+      let message = Message::Text(json_message.clone());
+      if let Err(e) = ws_sink.send(message).await {
+        error!("Failed to send initial WebSocket message: {}", e);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        continue;
+      }
+      info!("Sent initial init message with endpoint ID {} to WebSocket", endpoint_id);
+      
+      // Keep connection alive and send periodic messages
+      loop {
+        tokio::select! {
+          // Send periodic messages
+          _ = interval.tick() => {
+            let message = StatsUpdateMessage {
+              message_type: "STATS_UPDATE".to_string(),
+              data: StatsUpdateData {
+                token: token.clone(),
+                stats: UserStats {
+                  audio: false,
+                  connection_quality: 100.0,
+                  endpoint_id: endpoint_id.clone(),
+                  is_production_muted: false,
+                  name: nick.clone(),
+                  room: room_name.clone(),
+                  screenshare: false,
+                  status: "active".to_string(),
+                  video: true,
+                  vssrc: 0,
+                }
+              },
+            };
+            let message = Message::Text(serde_json::to_string(&message).unwrap());
+            if let Err(e) = ws_sink.send(message).await {
+              error!("Failed to send update endpoint ID message: {}", e);
               break;
             }
-            Some(Ok(_)) => {
-              // Ignore other messages for now
-            }
-            Some(Err(e)) => {
-              error!("WebSocket error: {}", e);
-              break;
-            }
-            None => {
-              info!("WebSocket stream ended");
-              break;
+            trace!("Sent update endpoint ID message with endpoint ID {} to WebSocket", endpoint_id);
+          }
+          
+          // Handle incoming messages (optional - just to keep connection alive)
+          msg = ws_stream.next() => {
+            match msg {
+              Some(Ok(Message::Close(_))) => {
+                info!("WebSocket connection closed by server");
+                break;
+              }
+              Some(Ok(_)) => {
+                // Ignore other messages for now
+              }
+              Some(Err(e)) => {
+                error!("WebSocket error: {}", e);
+                break;
+              }
+              None => {
+                info!("WebSocket stream ended");
+                break;
+              }
             }
           }
         }
       }
+      
+      info!("WebSocket connection ended for endpoint ID: {}", endpoint_id);
+      
+      // Wait 1 second before respawning
+      tokio::time::sleep(Duration::from_secs(5)).await;
     }
-    
-    info!("WebSocket connection ended for endpoint ID: {}", endpoint_id);
   });
 /*
   let conference2 = conference.clone();

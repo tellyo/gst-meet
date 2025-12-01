@@ -1,5 +1,11 @@
 use std::{
-  collections::HashMap, convert::TryFrom, fmt, future::Future, pin::Pin, sync::Arc, time::Duration,
+  collections::HashMap,
+  convert::TryFrom,
+  fmt,
+  future::Future,
+  pin::Pin,
+  sync::{Arc, Mutex as StdMutex},
+  time::Duration,
 };
 
 use anyhow::{bail, Context, Result};
@@ -110,6 +116,7 @@ pub struct JitsiConference {
   pub(crate) jingle_session: Arc<Mutex<Option<JingleSession>>>,
   pub(crate) inner: Arc<Mutex<JitsiConferenceInner>>,
   pub(crate) tls_insecure: bool,
+  pub(crate) latest_stats: Arc<StdMutex<ColibriMessage>>,
 }
 
 impl fmt::Debug for JitsiConference {
@@ -235,6 +242,34 @@ impl JitsiConference {
         .map(|feature| feature.into()),
     );
 
+    let initial_stats = ColibriMessage::EndpointStats {
+      from: None,
+      bitrate: colibri::Bitrates {
+        audio: colibri::Bitrate {
+          upload: 0,
+          download: 0,
+        },
+        video: colibri::Bitrate {
+          upload: 0,
+          download: 0,
+        },
+        total: colibri::Bitrate {
+          upload: 0,
+          download: 0,
+        },
+      },
+      packet_loss: colibri::PacketLoss {
+        total: 0,
+        download: 0,
+        upload: 0,
+      },
+      connection_quality: 0.0,
+      jvb_rtt: None,
+      server_region: config.region.clone(),
+      max_enabled_resolution: None,
+    };
+    let latest_stats = Arc::new(StdMutex::new(initial_stats));
+
     let conference = Self {
       glib_main_context,
       jid,
@@ -255,6 +290,7 @@ impl JitsiConference {
         connected_tx: Some(tx),
       })),
       tls_insecure: xmpp_connection.tls_insecure,
+      latest_stats,
     };
 
     xmpp_connection.add_stanza_filter(conference.clone()).await;
@@ -453,6 +489,10 @@ impl JitsiConference {
     };
     self.xmpp_tx.send(message.into()).await?;
     Ok(())
+  }
+
+  pub fn get_latest_stats(&self) -> ColibriMessage {
+    self.latest_stats.lock().unwrap().clone()
   }
 
   pub(crate) async fn ensure_participant(&self, id: &str) -> Result<()> {
@@ -993,6 +1033,10 @@ impl JitsiConference {
                     server_region: self_.config.region.clone(),
                     max_enabled_resolution: self_.inner.lock().await.send_resolution,
                   };
+                  {
+                    let mut latest_stats = self_.latest_stats.lock().unwrap();
+                    *latest_stats = stats.clone();
+                  }
                   if let Err(e) = colibri_channel.send(stats).await {
                     warn!("failed to send stats: {:?}", e);
                     std::process::exit(0);

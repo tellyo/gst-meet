@@ -2,7 +2,7 @@ use std::{
   collections::HashMap, convert::TryFrom, fmt, future::Future, pin::Pin, sync::Arc, time::Duration,
 };
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use colibri::{ColibriMessage, JsonMessage};
 use futures::stream::StreamExt;
@@ -525,6 +525,545 @@ impl JitsiConference {
   ) {
     self.inner.lock().await.on_colibri_message = Some(Arc::new(f));
   }
+
+  async fn handle_discovering_state(&self, element: xmpp_parsers::Element) -> Result<()> {
+    if let Ok(iq) = Iq::try_from(element) {
+      if let IqType::Result(Some(element)) = iq.payload {
+        let ready: bool = element
+          .attr("ready")
+          .context("missing ready attribute on conference IQ")?
+          .parse()?;
+        if !ready {
+          bail!("focus reports room not ready");
+        }
+      }
+      else {
+        bail!("focus IQ failed");
+      };
+
+      let mut locked_inner = self.inner.lock().await;
+      self.send_presence(&locked_inner.presence).await?;
+      locked_inner.state = JitsiConferenceState::JoiningMuc;
+    }
+    else {
+      debug!("ignored non-IQ stanza while waiting for conference IQ");
+    }
+    Ok(())
+  }
+
+  async fn handle_joining_muc_state(&self, element: xmpp_parsers::Element) -> Result<()> {
+    if let Ok(presence) = Presence::try_from(element) {
+      if let Some(payload) = presence
+        .payloads
+        .into_iter()
+        .find(|payload| payload.is("x", ns::MUC_USER))
+      {
+        let muc_user = MucUser::try_from(payload)?;
+        debug!("MucUser: {:?}", muc_user);
+        if muc_user.status.contains(&MucStatus::SelfPresence) {
+          debug!("Joined MUC: {}", self.config.muc);
+          self.inner.lock().await.state = JitsiConferenceState::Idle;
+        }
+        else {
+          debug!("MUC user payload is not a self-presence");
+        }
+      }
+      else {
+        debug!("no MUC user payload in presence stanza");
+      }
+    }
+    else {
+      debug!("ignored non-presence stanza while waiting to join MUC");
+    }
+    Ok(())
+  }
+
+  async fn handle_idle_state(&self, element: xmpp_parsers::Element) -> Result<()> {
+    if let Ok(iq) = Iq::try_from(element.clone()) {
+      let Iq { id, from, payload, .. } = iq;
+      match payload {
+        IqType::Get(element) => {
+          self.handle_idle_iq_get(id, from, element).await?;
+        },
+        IqType::Set(element) => {
+          self.handle_idle_iq_set(id, from, element).await?;
+        },
+        IqType::Result(_) => {
+          self.handle_idle_iq_result(id).await?;
+        },
+        _ => {},
+      }
+    }
+    else if let Ok(presence) = Presence::try_from(element) {
+      if let Jid::Full(from) = presence
+        .from
+        .as_ref()
+        .context("missing from in presence")?
+        .clone()
+      {
+        let bare_from: BareJid = from.clone().to_bare();
+        if bare_from == self.config.muc && from.resource_str() != "focus" {
+          trace!("received MUC presence from {}", from.resource());
+          let nick_payload = presence
+            .payloads
+            .iter()
+            .find(|e| e.is("nick", ns::NICK))
+            .map(|e| Nick::try_from(e.clone()))
+            .transpose()?;
+          if let Some(mut muc_user_payload) = presence
+            .payloads
+            .into_iter()
+            .find(|e| e.is("x", ns::MUC_USER))
+          {
+            // Hack until https://gitlab.com/xmpp-rs/xmpp-rs/-/issues/88 is resolved
+            // We're not interested in the actor element, and xmpp-parsers fails to parse it, so just remove it.
+            for item in muc_user_payload
+              .children_mut()
+              .filter(|child| child.name() == "item")
+            {
+              while item.remove_child("actor", ns::MUC_USER).is_some() {}
+            }
+
+            let muc_user = MucUser::try_from(muc_user_payload)?;
+            for item in muc_user.items {
+              if let Some(jid) = &item.jid {
+                if jid == &self.jid {
+                  continue;
+                }
+                let participant = Participant {
+                  jid: Some(jid.clone()),
+                  muc_jid: from.clone(),
+                  nick: item
+                    .nick
+                    .or_else(|| nick_payload.as_ref().map(|nick| nick.0.clone())),
+                };
+                if presence.type_ == presence::Type::Unavailable
+                  && self
+                    .inner
+                    .lock()
+                    .await
+                    .participants
+                    .remove(&from.resource().clone())
+                    .is_some()
+                {
+                  debug!("participant left: {:?}", jid);
+                  if let Some(f) = &self
+                    .inner
+                    .lock()
+                    .await
+                    .on_participant_left
+                    .as_ref()
+                    .cloned()
+                  {
+                    debug!("calling on_participant_left with old participant");
+                    if let Err(e) = f(self.clone(), participant).await {
+                      warn!("on_participant_left failed: {:?}", e);
+                    }
+                  }
+                }
+                else if self
+                  .inner
+                  .lock()
+                  .await
+                  .participants
+                  .insert(from.resource().clone(), participant.clone())
+                  .is_none()
+                {
+                  debug!("new participant: {:?}", jid);
+                  if let Some(f) = &self.inner.lock().await.on_participant.as_ref().cloned() {
+                    debug!("calling on_participant with new participant");
+                    if let Err(e) = f(self.clone(), participant.clone()).await {
+                      warn!("on_participant failed: {:?}", e);
+                    }
+                    else if let Some(jingle_session) = self.jingle_session.lock().await.as_ref() {
+                      jingle_session.pipeline().debug_to_dot_file(
+                        gstreamer::DebugGraphDetails::ALL,
+                        &format!("participant-added-{}", participant.muc_jid.resource()),
+                      );
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    Ok(())
+  }
+
+  async fn handle_idle_iq_get(
+    &self,
+    iq_id: String,
+    iq_from: Option<Jid>,
+    element: xmpp_parsers::Element,
+  ) -> Result<()> {
+    if let Ok(query) = DiscoInfoQuery::try_from(element) {
+      debug!(
+        "Received disco info query from {} for node {:?}",
+        iq_from.as_ref().unwrap(),
+        query.node
+      );
+      if let Some(node) = query.node {
+        match node.splitn(2, '#').collect::<Vec<_>>().as_slice() {
+          // TODO: also support ecaps2, as we send it in our presence.
+          [uri, hash] if *uri == DISCO_NODE && *hash == COMPUTED_CAPS_HASH.to_base64() => {
+            let mut disco_info = DISCO_INFO.clone();
+            disco_info.node = Some(node);
+            let iq = Iq::from_result(iq_id.clone(), Some(disco_info))
+              .with_from(Jid::Full(self.jid.clone()))
+              .with_to(iq_from.clone().unwrap());
+            self.xmpp_tx.send(iq.into()).await?;
+          },
+          _ => {
+            let error = StanzaError::new(
+              ErrorType::Cancel,
+              DefinedCondition::ItemNotFound,
+              "en",
+              format!("Unknown disco#info node: {}", node),
+            );
+            let iq = Iq::from_error(iq_id.clone(), error)
+              .with_from(Jid::Full(self.jid.clone()))
+              .with_to(iq_from.clone().unwrap());
+            self.xmpp_tx.send(iq.into()).await?;
+          },
+        }
+      }
+      else {
+        let iq = Iq::from_result(iq_id, Some(DISCO_INFO.clone()))
+          .with_from(Jid::Full(self.jid.clone()))
+          .with_to(iq_from.unwrap());
+        self.xmpp_tx.send(iq.into()).await?;
+      }
+    }
+    Ok(())
+  }
+
+  async fn handle_idle_iq_set(
+    &self,
+    iq_id: String,
+    iq_from: Option<Jid>,
+    element: xmpp_parsers::Element,
+  ) -> Result<()> {
+    match Jingle::try_from(element) {
+      Ok(jingle) => {
+        if let Some(Jid::Full(from_jid)) = iq_from.clone() {
+          if jingle.action == Action::SessionInitiate {
+            if from_jid.resource_str() == "focus" {
+              // Acknowledge the IQ
+              let result_iq = Iq::empty_result(Jid::Full(from_jid.clone()), iq_id.clone())
+                .with_from(Jid::Full(self.jid.clone()));
+              self.xmpp_tx.send(result_iq.into()).await?;
+
+              *self.jingle_session.lock().await = Some(JingleSession::initiate(self, jingle).await?);
+            }
+            else {
+              debug!("Ignored Jingle session-initiate from {}", from_jid);
+            }
+          }
+          else if jingle.action == Action::SourceAdd {
+            debug!("Received Jingle source-add");
+
+            // Acknowledge the IQ
+            let result_iq = Iq::empty_result(Jid::Full(from_jid.clone()), iq_id.clone())
+              .with_from(Jid::Full(self.jid.clone()));
+            self.xmpp_tx.send(result_iq.into()).await?;
+
+            self
+              .jingle_session
+              .lock()
+              .await
+              .as_mut()
+              .context("not connected (no jingle session")?
+              .source_add(jingle)
+              .await?;
+          }
+        }
+        else {
+          debug!("Received Jingle IQ from invalid JID: {:?}", iq_from);
+        }
+      },
+      Err(e) => debug!("IQ did not successfully parse as Jingle: {:?}", e),
+    }
+    Ok(())
+  }
+
+  async fn handle_idle_iq_result(&self, iq_id: String) -> Result<()> {
+    if let Some(jingle_session) = self.jingle_session.lock().await.as_mut() {
+      if Some(iq_id.clone()) == jingle_session.accept_iq_id {
+        let colibri_url = jingle_session.colibri_url.clone();
+
+        jingle_session.accept_iq_id = None;
+
+        debug!("Focus acknowledged session-accept");
+
+        if let Some(colibri_url) = colibri_url {
+          info!("Connecting Colibri WebSocket to {}", colibri_url);
+          let colibri_channel = ColibriChannel::new(&colibri_url, self.tls_insecure).await?;
+          let (tx, rx) = mpsc::channel(8);
+          colibri_channel.subscribe(tx).await;
+          jingle_session.colibri_channel = Some(colibri_channel.clone());
+
+          let my_endpoint_id = self.endpoint_id()?.to_owned();
+
+          info!("Sending source video type message");
+          if let Err(e) = colibri_channel
+            .send(ColibriMessage::SourceVideoTypeMessage {
+              source_name: format!("{my_endpoint_id}-v0"),
+              video_type: colibri::VideoType::Camera,
+            })
+            .await
+          {
+            warn!("Failed to send source video type message: {e:?}");
+          }
+
+          {
+            let my_endpoint_id = my_endpoint_id.clone();
+            let colibri_channel = colibri_channel.clone();
+            let self_ = self.clone();
+            jingle_session.stats_handler_task = Some(tokio::spawn(async move {
+              let mut interval = time::interval(SEND_STATS_INTERVAL);
+              loop {
+                let maybe_remote_ssrc_map = self_
+                  .jingle_session
+                  .lock()
+                  .await
+                  .as_ref()
+                  .map(|sess| sess.remote_ssrc_map.clone());
+                let maybe_source_stats: Option<Vec<gstreamer::Structure>> = self_
+                  .pipeline()
+                  .await
+                  .ok()
+                  .and_then(|pipeline| pipeline.by_name("rtpbin"))
+                  .map(|rtpbin| rtpbin.emit_by_name("get-session", &[&0u32]))
+                  .map(|rtpsession: gstreamer::Element| rtpsession.property("stats"))
+                  .and_then(|stats: gstreamer::Structure| stats.get("source-stats").ok())
+                  .and_then(|stats: glib::ValueArray| {
+                    stats
+                      .into_iter()
+                      .map(|v| v.get())
+                      .collect::<Result<_, _>>()
+                      .ok()
+                  });
+
+                if let (Some(remote_ssrc_map), Some(source_stats)) =
+                  (maybe_remote_ssrc_map, maybe_source_stats)
+                {
+                  debug!("source stats: {:#?}", source_stats);
+
+                  let audio_recv_bitrate: u64 = source_stats
+                    .iter()
+                    .filter(|stat| {
+                      stat
+                        .get("ssrc")
+                        .ok()
+                        .and_then(|ssrc: u32| remote_ssrc_map.get(&ssrc))
+                        .map(|source| {
+                          source.media_type == MediaType::Audio
+                            && source
+                              .participant_id
+                              .as_ref()
+                              .map(|id| id != &my_endpoint_id)
+                              .unwrap_or_default()
+                        })
+                        .unwrap_or_default()
+                    })
+                    .filter_map(|stat| stat.get::<u64>("bitrate").ok())
+                    .sum();
+
+                  let video_recv_bitrate: u64 = source_stats
+                    .iter()
+                    .filter(|stat| {
+                      stat
+                        .get("ssrc")
+                        .ok()
+                        .and_then(|ssrc: u32| remote_ssrc_map.get(&ssrc))
+                        .map(|source| {
+                          source.media_type == MediaType::Video
+                            && source
+                              .participant_id
+                              .as_ref()
+                              .map(|id| id != &my_endpoint_id)
+                              .unwrap_or_default()
+                        })
+                        .unwrap_or_default()
+                    })
+                    .filter_map(|stat| stat.get::<u64>("bitrate").ok())
+                    .sum();
+
+                  let audio_send_bitrate: u64 = source_stats
+                    .iter()
+                    .find(|stat| {
+                      stat
+                        .get("ssrc")
+                        .ok()
+                        .and_then(|ssrc: u32| remote_ssrc_map.get(&ssrc))
+                        .map(|source| {
+                          source.media_type == MediaType::Audio
+                            && source
+                              .participant_id
+                              .as_ref()
+                              .map(|id| id == &my_endpoint_id)
+                              .unwrap_or_default()
+                        })
+                        .unwrap_or_default()
+                    })
+                    .and_then(|stat| stat.get("bitrate").ok())
+                    .unwrap_or_default();
+                  let video_send_bitrate: u64 = source_stats
+                    .iter()
+                    .find(|stat| {
+                      stat
+                        .get("ssrc")
+                        .ok()
+                        .and_then(|ssrc: u32| remote_ssrc_map.get(&ssrc))
+                        .map(|source| {
+                          source.media_type == MediaType::Video
+                            && source
+                              .participant_id
+                              .as_ref()
+                              .map(|id| id == &my_endpoint_id)
+                              .unwrap_or_default()
+                        })
+                        .unwrap_or_default()
+                    })
+                    .and_then(|stat| stat.get("bitrate").ok())
+                    .unwrap_or_default();
+
+                  let recv_packets: u64 = source_stats
+                    .iter()
+                    .filter(|stat| {
+                      stat
+                        .get("ssrc")
+                        .ok()
+                        .and_then(|ssrc: u32| remote_ssrc_map.get(&ssrc))
+                        .map(|source| {
+                          source
+                            .participant_id
+                            .as_ref()
+                            .map(|id| id != &my_endpoint_id)
+                            .unwrap_or_default()
+                        })
+                        .unwrap_or_default()
+                    })
+                    .filter_map(|stat| stat.get::<u64>("packets-received").ok())
+                    .sum();
+                  let recv_lost: u64 = source_stats
+                    .iter()
+                    .filter(|stat| {
+                      stat
+                        .get("ssrc")
+                        .ok()
+                        .and_then(|ssrc: u32| remote_ssrc_map.get(&ssrc))
+                        .map(|source| {
+                          source.participant_id.as_ref().map(|id| id != &my_endpoint_id).unwrap_or_default()
+                        })
+                        .unwrap_or_default()
+                    })
+                    .filter_map(|stat| stat.get::<i32>("packets-lost").ok())
+                    .sum::<i32>()
+                    // Loss can be negative because of duplicate packets. Clamp it to zero.
+                    .try_into()
+                    .unwrap_or_default();
+                  let recv_loss = recv_lost as f64 / (recv_packets as f64 + recv_lost as f64);
+
+                  let stats = ColibriMessage::EndpointStats {
+                    from: None,
+                    bitrate: colibri::Bitrates {
+                      audio: colibri::Bitrate {
+                        upload: audio_send_bitrate / 1024,
+                        download: audio_recv_bitrate / 1024,
+                      },
+                      video: colibri::Bitrate {
+                        upload: video_send_bitrate / 1024,
+                        download: video_recv_bitrate / 1024,
+                      },
+                      total: colibri::Bitrate {
+                        upload: (audio_send_bitrate + video_send_bitrate) / 1024,
+                        download: (audio_recv_bitrate + video_recv_bitrate) / 1024,
+                      },
+                    },
+                    packet_loss: colibri::PacketLoss {
+                      total: (recv_loss * 100.) as u64,
+                      download: (recv_loss * 100.) as u64,
+                      upload: 0, // TODO
+                    },
+                    connection_quality: 100.0,
+                    jvb_rtt: Some(0), // TODO
+                    server_region: self_.config.region.clone(),
+                    max_enabled_resolution: self_.inner.lock().await.send_resolution,
+                  };
+                  if let Err(e) = colibri_channel.send(stats).await {
+                    warn!("failed to send stats: {:?}", e);
+                    std::process::exit(0);
+                  }
+                }
+                else {
+                  warn!("unable to get stats from pipeline");
+                }
+                interval.tick().await;
+              }
+            }));
+          }
+
+          {
+            let self_ = self.clone();
+            tokio::spawn(async move {
+              let mut stream = ReceiverStream::new(rx);
+              while let Some(msg) = stream.next().await {
+                // Some message types are handled internally rather than passed to the on_colibri_message handler.
+                let handled = match &msg {
+                  ColibriMessage::EndpointMessage {
+                    to: Some(to),
+                    from,
+                    msg_payload,
+                  } if to == &my_endpoint_id => {
+                    match serde_json::from_value::<JsonMessage>(msg_payload.clone()) {
+                      Ok(JsonMessage::E2ePingRequest { id }) => {
+                        if let Err(e) = colibri_channel
+                          .send(ColibriMessage::EndpointMessage {
+                            from: None,
+                            to: from.clone(),
+                            msg_payload: serde_json::to_value(
+                              JsonMessage::E2ePingResponse { id },
+                            )
+                            .unwrap(),
+                          })
+                          .await
+                        {
+                          warn!("failed to send e2e ping response: {:?}", e);
+                        }
+                        true
+                      },
+                      _ => false,
+                    }
+                  },
+                  _ => false,
+                };
+
+                if handled {
+                  continue;
+                }
+
+                let locked_inner = self_.inner.lock().await;
+                if let Some(f) = &locked_inner.on_colibri_message {
+                  if let Err(e) = f(self_.clone(), msg).await {
+                    warn!("on_colibri_message failed: {:?}", e);
+                  }
+                }
+              }
+              Ok::<_, anyhow::Error>(())
+            });
+          }
+        }
+
+        if let Some(connected_tx) = self.inner.lock().await.connected_tx.take() {
+          connected_tx.send(()).unwrap();
+        }
+      }
+    }
+    Ok(())
+  }
 }
 
 #[async_trait]
@@ -546,516 +1085,9 @@ impl StanzaFilter for JitsiConference {
     use JitsiConferenceState::*;
     let state = self.inner.lock().await.state;
     match state {
-      Discovering => {
-        if let Ok(iq) = Iq::try_from(element) {
-          if let IqType::Result(Some(element)) = iq.payload {
-            let ready: bool = element
-              .attr("ready")
-              .context("missing ready attribute on conference IQ")?
-              .parse()?;
-            if !ready {
-              bail!("focus reports room not ready");
-            }
-          }
-          else {
-            bail!("focus IQ failed");
-          };
-
-          let mut locked_inner = self.inner.lock().await;
-          self.send_presence(&locked_inner.presence).await?;
-          locked_inner.state = JoiningMuc;
-        }
-        else {
-          debug!("ignored non-IQ stanza while waiting for conference IQ");
-        }
-      },
-      JoiningMuc => {
-        if let Ok(presence) = Presence::try_from(element) {
-          if let Some(payload) = presence
-            .payloads
-            .into_iter()
-            .find(|payload| payload.is("x", ns::MUC_USER))
-          {
-            let muc_user = MucUser::try_from(payload)?;
-            debug!("MucUser: {:?}", muc_user);
-            if muc_user.status.contains(&MucStatus::SelfPresence) {
-              debug!("Joined MUC: {}", self.config.muc);
-              self.inner.lock().await.state = Idle;
-            }
-            else {
-              debug!("MUC user payload is not a self-presence");
-            }
-          }
-          else {
-            debug!("no MUC user payload in presence stanza");
-          }
-        }
-        else {
-          debug!("ignored non-presence stanza while waiting to join MUC");
-        }
-      },
-      Idle => {
-        if let Ok(iq) = Iq::try_from(element.clone()) {
-          match iq.payload {
-            IqType::Get(element) => {
-              if let Ok(query) = DiscoInfoQuery::try_from(element) {
-                debug!(
-                  "Received disco info query from {} for node {:?}",
-                  iq.from.as_ref().unwrap(),
-                  query.node
-                );
-                if let Some(node) = query.node {
-                  match node.splitn(2, '#').collect::<Vec<_>>().as_slice() {
-                    // TODO: also support ecaps2, as we send it in our presence.
-                    [uri, hash]
-                      if *uri == DISCO_NODE && *hash == COMPUTED_CAPS_HASH.to_base64() =>
-                    {
-                      let mut disco_info = DISCO_INFO.clone();
-                      disco_info.node = Some(node);
-                      let iq = Iq::from_result(iq.id, Some(disco_info))
-                        .with_from(Jid::Full(self.jid.clone()))
-                        .with_to(iq.from.unwrap());
-                      self.xmpp_tx.send(iq.into()).await?;
-                    },
-                    _ => {
-                      let error = StanzaError::new(
-                        ErrorType::Cancel,
-                        DefinedCondition::ItemNotFound,
-                        "en",
-                        format!("Unknown disco#info node: {}", node),
-                      );
-                      let iq = Iq::from_error(iq.id, error)
-                        .with_from(Jid::Full(self.jid.clone()))
-                        .with_to(iq.from.unwrap());
-                      self.xmpp_tx.send(iq.into()).await?;
-                    },
-                  }
-                }
-                else {
-                  let iq = Iq::from_result(iq.id, Some(DISCO_INFO.clone()))
-                    .with_from(Jid::Full(self.jid.clone()))
-                    .with_to(iq.from.unwrap());
-                  self.xmpp_tx.send(iq.into()).await?;
-                }
-              }
-            },
-            IqType::Set(element) => match Jingle::try_from(element) {
-              Ok(jingle) => {
-                if let Some(Jid::Full(from_jid)) = iq.from {
-                  if jingle.action == Action::SessionInitiate {
-                    if from_jid.resource_str() == "focus" {
-                      // Acknowledge the IQ
-                      let result_iq = Iq::empty_result(Jid::Full(from_jid.clone()), iq.id.clone())
-                        .with_from(Jid::Full(self.jid.clone()));
-                      self.xmpp_tx.send(result_iq.into()).await?;
-
-                      *self.jingle_session.lock().await =
-                        Some(JingleSession::initiate(self, jingle).await?);
-                    }
-                    else {
-                      debug!("Ignored Jingle session-initiate from {}", from_jid);
-                    }
-                  }
-                  else if jingle.action == Action::SourceAdd {
-                    debug!("Received Jingle source-add");
-
-                    // Acknowledge the IQ
-                    let result_iq = Iq::empty_result(Jid::Full(from_jid.clone()), iq.id.clone())
-                      .with_from(Jid::Full(self.jid.clone()));
-                    self.xmpp_tx.send(result_iq.into()).await?;
-
-                    self
-                      .jingle_session
-                      .lock()
-                      .await
-                      .as_mut()
-                      .context("not connected (no jingle session")?
-                      .source_add(jingle)
-                      .await?;
-                  }
-                }
-                else {
-                  debug!("Received Jingle IQ from invalid JID: {:?}", iq.from);
-                }
-              },
-              Err(e) => debug!("IQ did not successfully parse as Jingle: {:?}", e),
-            },
-            IqType::Result(_) => {
-              if let Some(jingle_session) = self.jingle_session.lock().await.as_mut() {
-                if Some(iq.id) == jingle_session.accept_iq_id {
-                  let colibri_url = jingle_session.colibri_url.clone();
-
-                  jingle_session.accept_iq_id = None;
-
-                  debug!("Focus acknowledged session-accept");
-
-                  if let Some(colibri_url) = colibri_url {
-                    info!("Connecting Colibri WebSocket to {}", colibri_url);
-                    let colibri_channel =
-                      ColibriChannel::new(&colibri_url, self.tls_insecure).await?;
-                    let (tx, rx) = mpsc::channel(8);
-                    colibri_channel.subscribe(tx).await;
-                    jingle_session.colibri_channel = Some(colibri_channel.clone());
-
-                    let my_endpoint_id = self.endpoint_id()?.to_owned();
-
-                    info!("Sending source video type message");
-                    if let Err(e) = colibri_channel
-                      .send(ColibriMessage::SourceVideoTypeMessage {
-                        source_name: format!("{my_endpoint_id}-v0"),
-                        video_type: colibri::VideoType::Camera,
-                      })
-                      .await
-                    {
-                      warn!("Failed to send source video type message: {e:?}");
-                    }
-
-                    {
-                      let my_endpoint_id = my_endpoint_id.clone();
-                      let colibri_channel = colibri_channel.clone();
-                      let self_ = self.clone();
-                      jingle_session.stats_handler_task = Some(tokio::spawn(async move {
-                        let mut interval = time::interval(SEND_STATS_INTERVAL);
-                        loop {
-                          let maybe_remote_ssrc_map = self_
-                            .jingle_session
-                            .lock()
-                            .await
-                            .as_ref()
-                            .map(|sess| sess.remote_ssrc_map.clone());
-                          let maybe_source_stats: Option<Vec<gstreamer::Structure>> = self_
-                            .pipeline()
-                            .await
-                            .ok()
-                            .and_then(|pipeline| pipeline.by_name("rtpbin"))
-                            .map(|rtpbin| rtpbin.emit_by_name("get-session", &[&0u32]))
-                            .map(|rtpsession: gstreamer::Element| rtpsession.property("stats"))
-                            .and_then(|stats: gstreamer::Structure| stats.get("source-stats").ok())
-                            .and_then(|stats: glib::ValueArray| {
-                              stats
-                                .into_iter()
-                                .map(|v| v.get())
-                                .collect::<Result<_, _>>()
-                                .ok()
-                            });
-
-                          if let (Some(remote_ssrc_map), Some(source_stats)) =
-                            (maybe_remote_ssrc_map, maybe_source_stats)
-                          {
-                            debug!("source stats: {:#?}", source_stats);
-
-                            let audio_recv_bitrate: u64 = source_stats
-                              .iter()
-                              .filter(|stat| {
-                                stat
-                                  .get("ssrc")
-                                  .ok()
-                                  .and_then(|ssrc: u32| remote_ssrc_map.get(&ssrc))
-                                  .map(|source| {
-                                    source.media_type == MediaType::Audio
-                                      && source
-                                        .participant_id
-                                        .as_ref()
-                                        .map(|id| id != &my_endpoint_id)
-                                        .unwrap_or_default()
-                                  })
-                                  .unwrap_or_default()
-                              })
-                              .filter_map(|stat| stat.get::<u64>("bitrate").ok())
-                              .sum();
-
-                            let video_recv_bitrate: u64 = source_stats
-                              .iter()
-                              .filter(|stat| {
-                                stat
-                                  .get("ssrc")
-                                  .ok()
-                                  .and_then(|ssrc: u32| remote_ssrc_map.get(&ssrc))
-                                  .map(|source| {
-                                    source.media_type == MediaType::Video
-                                      && source
-                                        .participant_id
-                                        .as_ref()
-                                        .map(|id| id != &my_endpoint_id)
-                                        .unwrap_or_default()
-                                  })
-                                  .unwrap_or_default()
-                              })
-                              .filter_map(|stat| stat.get::<u64>("bitrate").ok())
-                              .sum();
-
-                            let audio_send_bitrate: u64 = source_stats
-                              .iter()
-                              .find(|stat| {
-                                stat
-                                  .get("ssrc")
-                                  .ok()
-                                  .and_then(|ssrc: u32| remote_ssrc_map.get(&ssrc))
-                                  .map(|source| {
-                                    source.media_type == MediaType::Audio
-                                      && source
-                                        .participant_id
-                                        .as_ref()
-                                        .map(|id| id == &my_endpoint_id)
-                                        .unwrap_or_default()
-                                  })
-                                  .unwrap_or_default()
-                              })
-                              .and_then(|stat| stat.get("bitrate").ok())
-                              .unwrap_or_default();
-                            let video_send_bitrate: u64 = source_stats
-                              .iter()
-                              .find(|stat| {
-                                stat
-                                  .get("ssrc")
-                                  .ok()
-                                  .and_then(|ssrc: u32| remote_ssrc_map.get(&ssrc))
-                                  .map(|source| {
-                                    source.media_type == MediaType::Video
-                                      && source
-                                        .participant_id
-                                        .as_ref()
-                                        .map(|id| id == &my_endpoint_id)
-                                        .unwrap_or_default()
-                                  })
-                                  .unwrap_or_default()
-                              })
-                              .and_then(|stat| stat.get("bitrate").ok())
-                              .unwrap_or_default();
-
-                            let recv_packets: u64 = source_stats
-                              .iter()
-                              .filter(|stat| {
-                                stat
-                                  .get("ssrc")
-                                  .ok()
-                                  .and_then(|ssrc: u32| remote_ssrc_map.get(&ssrc))
-                                  .map(|source| {
-                                    source
-                                      .participant_id
-                                      .as_ref()
-                                      .map(|id| id != &my_endpoint_id)
-                                      .unwrap_or_default()
-                                  })
-                                  .unwrap_or_default()
-                              })
-                              .filter_map(|stat| stat.get::<u64>("packets-received").ok())
-                              .sum();
-                            let recv_lost: u64 = source_stats
-                              .iter()
-                              .filter(|stat| {
-                                stat
-                                  .get("ssrc")
-                                  .ok()
-                                  .and_then(|ssrc: u32| remote_ssrc_map.get(&ssrc))
-                                  .map(|source| source.participant_id.as_ref().map(|id| id != &my_endpoint_id).unwrap_or_default())
-                                  .unwrap_or_default()
-                              })
-                              .filter_map(|stat| stat.get::<i32>("packets-lost").ok())
-                              .sum::<i32>()
-                              // Loss can be negative because of duplicate packets. Clamp it to zero.
-                              .try_into()
-                              .unwrap_or_default();
-                            let recv_loss =
-                              recv_lost as f64 / (recv_packets as f64 + recv_lost as f64);
-
-                            let stats = ColibriMessage::EndpointStats {
-                              from: None,
-                              bitrate: colibri::Bitrates {
-                                audio: colibri::Bitrate {
-                                  upload: audio_send_bitrate / 1024,
-                                  download: audio_recv_bitrate / 1024,
-                                },
-                                video: colibri::Bitrate {
-                                  upload: video_send_bitrate / 1024,
-                                  download: video_recv_bitrate / 1024,
-                                },
-                                total: colibri::Bitrate {
-                                  upload: (audio_send_bitrate + video_send_bitrate) / 1024,
-                                  download: (audio_recv_bitrate + video_recv_bitrate) / 1024,
-                                },
-                              },
-                              packet_loss: colibri::PacketLoss {
-                                total: (recv_loss * 100.) as u64,
-                                download: (recv_loss * 100.) as u64,
-                                upload: 0, // TODO
-                              },
-                              connection_quality: 100.0,
-                              jvb_rtt: Some(0), // TODO
-                              server_region: self_.config.region.clone(),
-                              max_enabled_resolution: self_.inner.lock().await.send_resolution,
-                            };
-                            if let Err(e) = colibri_channel.send(stats).await {
-                              warn!("failed to send stats: {:?}", e);
-                              std::process::exit(0);
-                            }
-                          }
-                          else {
-                            warn!("unable to get stats from pipeline");
-                          }
-                          interval.tick().await;
-                        }
-                      }));
-                    }
-
-                    {
-                      let self_ = self.clone();
-                      tokio::spawn(async move {
-                        let mut stream = ReceiverStream::new(rx);
-                        while let Some(msg) = stream.next().await {
-                          // Some message types are handled internally rather than passed to the on_colibri_message handler.
-                          let handled = match &msg {
-                            ColibriMessage::EndpointMessage {
-                              to: Some(to),
-                              from,
-                              msg_payload,
-                            } if to == &my_endpoint_id => {
-                              match serde_json::from_value::<JsonMessage>(msg_payload.clone()) {
-                                Ok(JsonMessage::E2ePingRequest { id }) => {
-                                  if let Err(e) = colibri_channel
-                                    .send(ColibriMessage::EndpointMessage {
-                                      from: None,
-                                      to: from.clone(),
-                                      msg_payload: serde_json::to_value(
-                                        JsonMessage::E2ePingResponse { id },
-                                      )
-                                      .unwrap(),
-                                    })
-                                    .await
-                                  {
-                                    warn!("failed to send e2e ping response: {:?}", e);
-                                  }
-                                  true
-                                },
-                                _ => false,
-                              }
-                            },
-                            _ => false,
-                          };
-
-                          if handled {
-                            continue;
-                          }
-
-                          let locked_inner = self_.inner.lock().await;
-                          if let Some(f) = &locked_inner.on_colibri_message {
-                            if let Err(e) = f(self_.clone(), msg).await {
-                              warn!("on_colibri_message failed: {:?}", e);
-                            }
-                          }
-                        }
-                        Ok::<_, anyhow::Error>(())
-                      });
-                    }
-                  }
-
-                  if let Some(connected_tx) = self.inner.lock().await.connected_tx.take() {
-                    connected_tx.send(()).unwrap();
-                  }
-                }
-              }
-            },
-            _ => {},
-          }
-        }
-        else if let Ok(presence) = Presence::try_from(element) {
-          if let Jid::Full(from) = presence
-            .from
-            .as_ref()
-            .context("missing from in presence")?
-            .clone()
-          {
-            let bare_from: BareJid = from.clone().to_bare();
-            if bare_from == self.config.muc && from.resource_str() != "focus" {
-              trace!("received MUC presence from {}", from.resource());
-              let nick_payload = presence
-                .payloads
-                .iter()
-                .find(|e| e.is("nick", ns::NICK))
-                .map(|e| Nick::try_from(e.clone()))
-                .transpose()?;
-              if let Some(mut muc_user_payload) = presence
-                .payloads
-                .into_iter()
-                .find(|e| e.is("x", ns::MUC_USER))
-              {
-                // Hack until https://gitlab.com/xmpp-rs/xmpp-rs/-/issues/88 is resolved
-                // We're not interested in the actor element, and xmpp-parsers fails to parse it, so just remove it.
-                for item in muc_user_payload
-                  .children_mut()
-                  .filter(|child| child.name() == "item")
-                {
-                  while item.remove_child("actor", ns::MUC_USER).is_some() {}
-                }
-
-                let muc_user = MucUser::try_from(muc_user_payload)?;
-                for item in muc_user.items {
-                  if let Some(jid) = &item.jid {
-                    if jid == &self.jid {
-                      continue;
-                    }
-                    let participant = Participant {
-                      jid: Some(jid.clone()),
-                      muc_jid: from.clone(),
-                      nick: item
-                        .nick
-                        .or_else(|| nick_payload.as_ref().map(|nick| nick.0.clone())),
-                    };
-                    if presence.type_ == presence::Type::Unavailable
-                      && self
-                        .inner
-                        .lock()
-                        .await
-                        .participants
-                        .remove(&from.resource().clone())
-                        .is_some()
-                    {
-                      debug!("participant left: {:?}", jid);
-                      if let Some(f) = &self
-                        .inner
-                        .lock()
-                        .await
-                        .on_participant_left
-                        .as_ref()
-                        .cloned()
-                      {
-                        debug!("calling on_participant_left with old participant");
-                        if let Err(e) = f(self.clone(), participant).await {
-                          warn!("on_participant_left failed: {:?}", e);
-                        }
-                      }
-                    }
-                    else if self
-                      .inner
-                      .lock()
-                      .await
-                      .participants
-                      .insert(from.resource().clone(), participant.clone())
-                      .is_none()
-                    {
-                      debug!("new participant: {:?}", jid);
-                      if let Some(f) = &self.inner.lock().await.on_participant.as_ref().cloned() {
-                        debug!("calling on_participant with new participant");
-                        if let Err(e) = f(self.clone(), participant.clone()).await {
-                          warn!("on_participant failed: {:?}", e);
-                        }
-                        else if let Some(jingle_session) =
-                          self.jingle_session.lock().await.as_ref()
-                        {
-                          jingle_session.pipeline().debug_to_dot_file(
-                            gstreamer::DebugGraphDetails::ALL,
-                            &format!("participant-added-{}", participant.muc_jid.resource()),
-                          );
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      },
+      Discovering => self.handle_discovering_state(element).await?,
+      JoiningMuc => self.handle_joining_muc_state(element).await?,
+      Idle => self.handle_idle_state(element).await?,
     }
     Ok(())
   }

@@ -891,121 +891,13 @@ impl JitsiConference {
                 {
                   debug!("source stats: {:#?}", source_stats);
 
-                  let audio_recv_bitrate: u64 = source_stats
-                    .iter()
-                    .filter(|stat| {
-                      stat
-                        .get("ssrc")
-                        .ok()
-                        .and_then(|ssrc: u32| remote_ssrc_map.get(&ssrc))
-                        .map(|source| {
-                          source.media_type == MediaType::Audio
-                            && source
-                              .participant_id
-                              .as_ref()
-                              .map(|id| id != &my_endpoint_id)
-                              .unwrap_or_default()
-                        })
-                        .unwrap_or_default()
-                    })
-                    .filter_map(|stat| stat.get::<u64>("bitrate").ok())
-                    .sum();
-
-                  let video_recv_bitrate: u64 = source_stats
-                    .iter()
-                    .filter(|stat| {
-                      stat
-                        .get("ssrc")
-                        .ok()
-                        .and_then(|ssrc: u32| remote_ssrc_map.get(&ssrc))
-                        .map(|source| {
-                          source.media_type == MediaType::Video
-                            && source
-                              .participant_id
-                              .as_ref()
-                              .map(|id| id != &my_endpoint_id)
-                              .unwrap_or_default()
-                        })
-                        .unwrap_or_default()
-                    })
-                    .filter_map(|stat| stat.get::<u64>("bitrate").ok())
-                    .sum();
-
-                  let audio_send_bitrate: u64 = source_stats
-                    .iter()
-                    .find(|stat| {
-                      stat
-                        .get("ssrc")
-                        .ok()
-                        .and_then(|ssrc: u32| remote_ssrc_map.get(&ssrc))
-                        .map(|source| {
-                          source.media_type == MediaType::Audio
-                            && source
-                              .participant_id
-                              .as_ref()
-                              .map(|id| id == &my_endpoint_id)
-                              .unwrap_or_default()
-                        })
-                        .unwrap_or_default()
-                    })
-                    .and_then(|stat| stat.get("bitrate").ok())
-                    .unwrap_or_default();
-                  let video_send_bitrate: u64 = source_stats
-                    .iter()
-                    .find(|stat| {
-                      stat
-                        .get("ssrc")
-                        .ok()
-                        .and_then(|ssrc: u32| remote_ssrc_map.get(&ssrc))
-                        .map(|source| {
-                          source.media_type == MediaType::Video
-                            && source
-                              .participant_id
-                              .as_ref()
-                              .map(|id| id == &my_endpoint_id)
-                              .unwrap_or_default()
-                        })
-                        .unwrap_or_default()
-                    })
-                    .and_then(|stat| stat.get("bitrate").ok())
-                    .unwrap_or_default();
-
-                  let recv_packets: u64 = source_stats
-                    .iter()
-                    .filter(|stat| {
-                      stat
-                        .get("ssrc")
-                        .ok()
-                        .and_then(|ssrc: u32| remote_ssrc_map.get(&ssrc))
-                        .map(|source| {
-                          source
-                            .participant_id
-                            .as_ref()
-                            .map(|id| id != &my_endpoint_id)
-                            .unwrap_or_default()
-                        })
-                        .unwrap_or_default()
-                    })
-                    .filter_map(|stat| stat.get::<u64>("packets-received").ok())
-                    .sum();
-                  let recv_lost: u64 = source_stats
-                    .iter()
-                    .filter(|stat| {
-                      stat
-                        .get("ssrc")
-                        .ok()
-                        .and_then(|ssrc: u32| remote_ssrc_map.get(&ssrc))
-                        .map(|source| {
-                          source.participant_id.as_ref().map(|id| id != &my_endpoint_id).unwrap_or_default()
-                        })
-                        .unwrap_or_default()
-                    })
-                    .filter_map(|stat| stat.get::<i32>("packets-lost").ok())
-                    .sum::<i32>()
-                    // Loss can be negative because of duplicate packets. Clamp it to zero.
-                    .try_into()
-                    .unwrap_or_default();
-                  let recv_loss = recv_lost as f64 / (recv_packets as f64 + recv_lost as f64);
+                  let audio_recv_bitrate = get_audio_recv_bitrate(&source_stats, &my_endpoint_id, &remote_ssrc_map);
+                  let video_recv_bitrate = get_video_recv_bitrate(&source_stats, &my_endpoint_id, &remote_ssrc_map);
+                  let audio_send_bitrate = get_audio_send_bitrate(&source_stats, &my_endpoint_id, &remote_ssrc_map);
+                  let video_send_bitrate = get_video_send_bitrate(&source_stats, &my_endpoint_id, &remote_ssrc_map);
+                  //let recv_packets = get_recv_packets(&source_stats, &my_endpoint_id, &remote_ssrc_map);
+                  //let recv_lost = get_recv_lost(&source_stats, &my_endpoint_id, &remote_ssrc_map);
+                  let recv_loss = get_recv_loss(&source_stats, &my_endpoint_id, &remote_ssrc_map);
 
                   let stats = ColibriMessage::EndpointStats {
                     from: None,
@@ -1145,4 +1037,140 @@ fn endpoint_id_for_jid(jid: &FullJid) -> Result<&str> {
     .split('-')
     .next()
     .context("invalid jid")
+}
+
+
+fn get_audio_recv_bitrate(source_stats: &Vec<gstreamer::Structure>, my_endpoint_id: &str, remote_ssrc_map: &HashMap<u32, crate::source::Source>) -> u64 {
+  source_stats
+    .iter()
+    .filter(|stat| {
+      stat
+        .get("ssrc")
+        .ok()
+        .and_then(|ssrc: u32| remote_ssrc_map.get(&ssrc))
+        .map(|source| {
+          source.media_type == MediaType::Audio
+            && source
+              .participant_id
+              .as_ref()
+              .map(|id| id != my_endpoint_id)
+              .unwrap_or_default()
+        })
+        .unwrap_or_default()
+    })
+    .filter_map(|stat| stat.get::<u64>("bitrate").ok())
+    .sum()
+}
+
+fn get_video_recv_bitrate(source_stats: &Vec<gstreamer::Structure>, my_endpoint_id: &str, remote_ssrc_map: &HashMap<u32, crate::source::Source>) -> u64 {
+  source_stats
+    .iter()
+    .filter(|stat| {
+      stat
+        .get("ssrc")
+        .ok()
+        .and_then(|ssrc: u32| remote_ssrc_map.get(&ssrc))
+        .map(|source| {
+          source.media_type == MediaType::Video
+            && source
+              .participant_id
+              .as_ref()
+              .map(|id| id != &my_endpoint_id)
+              .unwrap_or_default()
+        })
+        .unwrap_or_default()
+    })
+    .filter_map(|stat| stat.get::<u64>("bitrate").ok())
+    .sum()
+}
+
+fn get_audio_send_bitrate(source_stats: &Vec<gstreamer::Structure>, my_endpoint_id: &str, remote_ssrc_map: &HashMap<u32, crate::source::Source>) -> u64 {
+  source_stats
+    .iter()
+    .find(|stat| {
+      stat
+        .get("ssrc")
+        .ok()
+        .and_then(|ssrc: u32| remote_ssrc_map.get(&ssrc))
+        .map(|source| {
+          source.media_type == MediaType::Audio
+            && source
+              .participant_id
+              .as_ref()
+              .map(|id| id == &my_endpoint_id)
+              .unwrap_or_default()
+        })
+        .unwrap_or_default()
+    })
+    .and_then(|stat| stat.get("bitrate").ok())
+    .unwrap_or_default()
+}
+
+fn get_video_send_bitrate(source_stats: &Vec<gstreamer::Structure>, my_endpoint_id: &str, remote_ssrc_map: &HashMap<u32, crate::source::Source>) -> u64 {
+  source_stats
+    .iter()
+    .find(|stat| {
+      stat
+        .get("ssrc")
+        .ok()
+        .and_then(|ssrc: u32| remote_ssrc_map.get(&ssrc))
+        .map(|source| {
+          source.media_type == MediaType::Video
+            && source
+              .participant_id
+              .as_ref()
+              .map(|id| id == &my_endpoint_id)
+              .unwrap_or_default()
+        })
+        .unwrap_or_default()
+    })
+    .and_then(|stat| stat.get("bitrate").ok())
+    .unwrap_or_default()
+}
+
+fn get_recv_packets(source_stats: &Vec<gstreamer::Structure>, my_endpoint_id: &str, remote_ssrc_map: &HashMap<u32, crate::source::Source>) -> u64 {
+  source_stats
+    .iter()
+    .filter(|stat| {
+      stat
+        .get("ssrc")
+        .ok()
+        .and_then(|ssrc: u32| remote_ssrc_map.get(&ssrc))
+        .map(|source| {
+          source
+            .participant_id
+            .as_ref()
+            .map(|id| id != &my_endpoint_id)
+            .unwrap_or_default()
+        })
+        .unwrap_or_default()
+    })
+    .filter_map(|stat| stat.get::<u64>("packets-received").ok())
+    .sum()
+}
+
+fn get_recv_lost(source_stats: &Vec<gstreamer::Structure>, my_endpoint_id: &str, remote_ssrc_map: &HashMap<u32, crate::source::Source>) -> u64 {
+  source_stats
+    .iter()
+    .filter(|stat| {
+      stat
+        .get("ssrc")
+        .ok()
+        .and_then(|ssrc: u32| remote_ssrc_map.get(&ssrc))
+        .map(|source| {
+          source.participant_id.as_ref().map(|id| id != &my_endpoint_id).unwrap_or_default()
+        })
+        .unwrap_or_default()
+    })
+    .filter_map(|stat| stat.get::<i32>("packets-lost").ok())
+    .sum::<i32>()
+    // Loss can be negative because of duplicate packets. Clamp it to zero.
+    .try_into()
+    .unwrap_or_default()
+}
+
+fn get_recv_loss(source_stats: &Vec<gstreamer::Structure>, my_endpoint_id: &str, remote_ssrc_map: &HashMap<u32, crate::source::Source>) -> f64 {
+  let recv_lost : u64 = get_recv_lost(source_stats, my_endpoint_id, remote_ssrc_map);
+
+  (recv_lost as f64 / (get_recv_packets(source_stats, my_endpoint_id, remote_ssrc_map) as f64 + recv_lost as f64))
 }

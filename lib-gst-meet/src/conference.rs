@@ -828,6 +828,33 @@ impl JitsiConference {
     Ok(())
   }
 
+  async fn get_maybe_remote_ssrc_map(&self) -> Option<HashMap<u32, crate::source::Source>> {
+    self
+      .jingle_session
+      .lock()
+      .await
+      .as_ref()
+      .map(|sess| sess.remote_ssrc_map.clone())
+  }
+
+  async fn get_maybe_source_stats(&self) -> Option<Vec<gstreamer::Structure>> {
+    self
+      .pipeline()
+      .await
+      .ok()
+      .and_then(|pipeline| pipeline.by_name("rtpbin"))
+      .map(|rtpbin| rtpbin.emit_by_name("get-session", &[&0u32]))
+      .map(|rtpsession: gstreamer::Element| rtpsession.property("stats"))
+      .and_then(|stats: gstreamer::Structure| stats.get("source-stats").ok())
+      .and_then(|stats: glib::ValueArray| {
+        stats
+          .into_iter()
+          .map(|v| v.get())
+          .collect::<Result<_, _>>()
+          .ok()
+      })
+  }
+
   async fn handle_idle_iq_result(&self, iq_id: String) -> Result<()> {
     if let Some(jingle_session) = self.jingle_session.lock().await.as_mut() {
       if Some(iq_id.clone()) == jingle_session.accept_iq_id {
@@ -864,27 +891,8 @@ impl JitsiConference {
             jingle_session.stats_handler_task = Some(tokio::spawn(async move {
               let mut interval = time::interval(SEND_STATS_INTERVAL);
               loop {
-                let maybe_remote_ssrc_map = self_
-                  .jingle_session
-                  .lock()
-                  .await
-                  .as_ref()
-                  .map(|sess| sess.remote_ssrc_map.clone());
-                let maybe_source_stats: Option<Vec<gstreamer::Structure>> = self_
-                  .pipeline()
-                  .await
-                  .ok()
-                  .and_then(|pipeline| pipeline.by_name("rtpbin"))
-                  .map(|rtpbin| rtpbin.emit_by_name("get-session", &[&0u32]))
-                  .map(|rtpsession: gstreamer::Element| rtpsession.property("stats"))
-                  .and_then(|stats: gstreamer::Structure| stats.get("source-stats").ok())
-                  .and_then(|stats: glib::ValueArray| {
-                    stats
-                      .into_iter()
-                      .map(|v| v.get())
-                      .collect::<Result<_, _>>()
-                      .ok()
-                  });
+                let maybe_remote_ssrc_map = self_.get_maybe_remote_ssrc_map().await;
+                let maybe_source_stats: Option<Vec<gstreamer::Structure>> = self_.get_maybe_source_stats().await;
 
                 if let (Some(remote_ssrc_map), Some(source_stats)) =
                   (maybe_remote_ssrc_map, maybe_source_stats)

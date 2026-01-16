@@ -157,7 +157,7 @@ struct ParsedRtpDescription {
 pub(crate) struct JingleSession {
   pipeline: gstreamer::Pipeline,
   audio_sink_element: gstreamer::Element,
-  video_sink_element: gstreamer::Element,
+  video_sink_elements: Vec<gstreamer::Element>,
   pub(crate) remote_ssrc_map: HashMap<u32, Source>,
   _ice_agent: nice::Agent,
   pub(crate) accept_iq_id: Option<String>,
@@ -182,8 +182,12 @@ impl JingleSession {
     self.audio_sink_element.clone()
   }
 
+  pub(crate) fn video_sink_elements(&self) -> Vec<gstreamer::Element> {
+    self.video_sink_elements.clone()
+  }
+
   pub(crate) fn video_sink_element(&self) -> gstreamer::Element {
-    self.video_sink_element.clone()
+    self.video_sink_elements[0].clone()
   }
 
   pub(crate) fn pause_all_sinks(&self) {
@@ -1164,73 +1168,20 @@ impl JingleSession {
     }
     pipeline.add(&audio_sink_element)?;
 
-    let codec_name = conference.config.video_codec.as_str();
-    let codec = codecs.iter().find(|codec| codec.is_codec(codec_name));
-    let video_sink_element = if let Some(codec) = codec {
-      let element = gstreamer::ElementFactory::make(codec.payloader_name()).build()?;
-      element.set_property("pt", codec.pt as u32);
-      if codec.name == CodecName::H264 {
-        element.set_property_from_str("aggregate-mode", "zero-latency");
-      }
-      else if codec.name == CodecName::Vp8 || codec.name == CodecName::Vp9 {
-        element.set_property_from_str("picture-id-mode", "15-bit");
-      }
-      element
-    }
-    else {
-      bail!("unsupported video codec: {}", codec_name);
-    };
-
-    if let Some(pspec) = video_sink_element.find_property("ssrc") {
-      match pspec.value_type() {
-        glib::Type::I64 => {
-          video_sink_element.set_property("ssrc", video_ssrc as i64);
-        }
-        glib::Type::U32 => {
-          video_sink_element.set_property("ssrc", video_ssrc);
-        }
-        _ => {
-          warn!(
-              "Unsupported ssrc type of the rtp payloader (expected i64 or u32)"
-          );
-        }
-      }
-    }
-
-    if video_sink_element.has_property("auto-header-extension", None) {
-      video_sink_element.set_property("auto-header-extension", false);
-      video_sink_element.connect("request-extension", false, move |values| {
-        let f = || {
-          let ext_id: u32 = values[1].get()?;
-          let ext_uri: String = values[2].get()?;
-          debug!(
-            "video payloader requested extension: {} {}",
-            ext_id, ext_uri
-          );
-          let hdrext =
-            RTPHeaderExtension::create_from_uri(&ext_uri).context("failed to create hdrext")?;
-          hdrext.set_id(ext_id);
-          Ok::<_, anyhow::Error>(hdrext)
-        };
-        match f() {
-          Ok(hdrext) => Some(hdrext.to_value()),
-          Err(e) => {
-            warn!("request-extension: {:?}", e);
-            None
-          },
-        }
-      });
-    }
-    else {
-      debug!("video payloader: no rtp header extension support");
-    }
-    pipeline.add(&video_sink_element)?;
-
     let rtpfunnel = gstreamer::ElementFactory::make("rtpfunnel").build()?;
     pipeline.add(&rtpfunnel)?;
 
-    debug!("linking video payloader -> rtpfunnel");
-    video_sink_element.link(&rtpfunnel)?;
+    // create three video sinks
+    let mut video_sink_elements = vec![];
+    for i in 0..3 {
+      let video_sink_element = JingleSession::create_video_sink_element(
+        conference.config.video_codec.as_str(),
+        &codecs, video_ssrc+i as u32)?;
+      pipeline.add(&video_sink_element)?;
+      debug!("linking video payloader -> rtpfunnel");
+      video_sink_element.link(&rtpfunnel)?;
+      video_sink_elements.push(video_sink_element);
+    }
 
     debug!("linking audio payloader -> rtpfunnel");
     audio_sink_element.link(&rtpfunnel)?;
@@ -1540,7 +1491,7 @@ impl JingleSession {
     Ok(Self {
       pipeline,
       audio_sink_element,
-      video_sink_element,
+      video_sink_elements,
       remote_ssrc_map,
       _ice_agent: ice_agent,
       accept_iq_id: Some(accept_iq_id),
@@ -1580,6 +1531,70 @@ impl JingleSession {
       }
     }
     Ok(())
+  }
+
+  fn create_video_sink_element(codec_name: &str, codecs: &Vec<Codec>, video_ssrc: u32) -> Result<gstreamer::Element> {
+    let codec = codecs.iter().find(|codec| codec.is_codec(codec_name));
+    let video_sink_element = if let Some(codec) = codec {
+      let element = gstreamer::ElementFactory::make(codec.payloader_name()).build()?;
+      element.set_property("pt", codec.pt as u32);
+      if codec.name == CodecName::H264 {
+        element.set_property_from_str("aggregate-mode", "zero-latency");
+      }
+      else if codec.name == CodecName::Vp8 || codec.name == CodecName::Vp9 {
+        element.set_property_from_str("picture-id-mode", "15-bit");
+      }
+      element
+    }
+    else {
+      bail!("unsupported video codec: {}", codec_name);
+    };
+
+    if let Some(pspec) = video_sink_element.find_property("ssrc") {
+      match pspec.value_type() {
+        glib::Type::I64 => {
+          video_sink_element.set_property("ssrc", video_ssrc as i64);
+        }
+        glib::Type::U32 => {
+          video_sink_element.set_property("ssrc", video_ssrc);
+        }
+        _ => {
+          warn!(
+              "Unsupported ssrc type of the rtp payloader (expected i64 or u32)"
+          );
+        }
+      }
+    }
+
+    if video_sink_element.has_property("auto-header-extension", None) {
+      video_sink_element.set_property("auto-header-extension", false);
+      video_sink_element.connect("request-extension", false, move |values| {
+        let f = || {
+          let ext_id: u32 = values[1].get()?;
+          let ext_uri: String = values[2].get()?;
+          debug!(
+            "video payloader requested extension: {} {}",
+            ext_id, ext_uri
+          );
+          let hdrext =
+            RTPHeaderExtension::create_from_uri(&ext_uri).context("failed to create hdrext")?;
+          hdrext.set_id(ext_id);
+          Ok::<_, anyhow::Error>(hdrext)
+        };
+        match f() {
+          Ok(hdrext) => Some(hdrext.to_value()),
+          Err(e) => {
+            warn!("request-extension: {:?}", e);
+            None
+          },
+        }
+      });
+    }
+    else {
+      debug!("video payloader: no rtp header extension support");
+    }
+
+    Ok(video_sink_element)
   }
 }
 

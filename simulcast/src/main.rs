@@ -1,13 +1,12 @@
 use std::{collections::HashMap, time::Duration};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 #[cfg(target_os = "macos")]
 use cocoa::appkit::NSApplication;
 use colibri::{ColibriMessage, Constraints, VideoType};
 use glib::object::ObjectExt as _;
 use gstreamer::{
-  prelude::{ElementExt as _, ElementExtManual as _, GstBinExt as _},
-  GhostPad,
+  GhostPad, prelude::{ElementExt as _, ElementExtManual, GstBinExt as _, GstBinExtManual, PadExt}
 };
 use http::Uri;
 use lib_gst_meet::{
@@ -37,48 +36,6 @@ struct InitData {
     #[serde(rename = "endpointId")]
     endpoint_id: String,
     token: String,
-}
-
-#[derive(Debug, Serialize)]
-struct UpdateEndpointIdMessage {
-    #[serde(rename = "type")]
-    message_type: String,
-    data: UpdateEndpointIdData,
-}
-
-#[derive(Debug, Serialize)]
-struct UpdateEndpointIdData {
-    #[serde(rename = "endpointId")]
-    endpoint_id: String,
-    token: String,
-    force: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct StatsUpdateMessage {
-    #[serde(rename = "type")]
-    message_type: String,
-    data: StatsUpdateData,
-}
-
-#[derive(Debug, Serialize)]
-struct StatsUpdateData {
-  token: String,
-  stats: UserStats,
-}
-
-#[derive(Debug, Serialize)]
-struct UserStats {
-  audio: bool,
-  connection_quality: f64,
-  endpoint_id: String,
-  is_production_muted: bool,
-  name: String,
-  room: String,
-  screenshare: bool,
-  status: String,
-  video: bool,
-  vssrc: i64,
 }
 
 #[derive(Debug, Clone, StructOpt)]
@@ -274,12 +231,12 @@ async fn main_inner() -> Result<()> {
 
   // Parse pipelines early so that we don't bother connecting to the conference if it's invalid.
 
-  let send_pipeline = opt
-    .send_pipeline
-    .as_ref()
-    .map(|pipeline| gstreamer::parse::bin_from_description(pipeline, false))
-    .transpose()
-    .context("failed to parse send pipeline")?;
+  // let send_pipeline = opt
+  //   .send_pipeline
+  //   .as_ref()
+  //   .map(|pipeline| gstreamer::parse::bin_from_description(pipeline, false))
+  //   .transpose()
+  //   .context("failed to parse send pipeline")?;
 
   let recv_pipeline = opt
     .recv_pipeline
@@ -287,6 +244,8 @@ async fn main_inner() -> Result<()> {
     .map(|pipeline| gstreamer::parse::bin_from_description(pipeline, false))
     .transpose()
     .context("failed to parse recv pipeline")?;
+
+  let send_bin = Some(create_simulcast_bin()?);
 
   let mut web_socket_url: Uri = opt.web_socket_url.parse()?;
   let mut web_socket_url_parts = web_socket_url.into_parts();
@@ -383,7 +342,7 @@ async fn main_inner() -> Result<()> {
   let config = JitsiConferenceConfig {
     muc: room_jid.parse()?,
     focus: focus_jid.parse()?,
-    nick: nick.clone(),
+    nick,
     region,
     video_codec,
     extra_muc_features: vec![],
@@ -435,7 +394,7 @@ async fn main_inner() -> Result<()> {
       .await?;
   }
 
-  if let Some(bin) = send_pipeline {
+  if let Some(bin) = send_bin {
     conference.add_bin(&bin).await?;
 
     if let Some(audio) = bin.by_name("audio") {
@@ -447,14 +406,31 @@ async fn main_inner() -> Result<()> {
       conference.set_muted(MediaType::Audio, true).await?;
     }
 
-    if let Some(video) = bin.by_name("video") {
-      info!("Found video element in pipeline, linking...");
-      let video_sinks = conference.video_sink_elements().await?;
-      video.link(&video_sinks[0])?;
+    let video_sinks = conference.video_sink_elements().await?;
+    // add all those three queues to the bin
+    if let Some(queue) = bin.by_name("queue_1080p") {
+      info!("Found video 1080p element in pipeline, linking...");
+      queue.link(&video_sinks[0])?;
     }
-    else {
-      conference.set_muted(MediaType::Video, true).await?;
+
+    if let Some(queue) = bin.by_name("queue_720p") {
+      info!("Found video 720p element in pipeline, linking...");
+      queue.link(&video_sinks[1])?;
     }
+
+    if let Some(queue) = bin.by_name("queue_360p") {
+      info!("Found video 360p element in pipeline, linking...");
+      queue.link(&video_sinks[2])?;
+    }
+
+    // if let Some(video) = bin.by_name("video") {
+    //   info!("Found video element in pipeline, linking...");
+    //   let video_sinks = conference.video_sink_elements().await?;
+    //   video.link(&video_sinks[0])?;
+    // }
+    // else {
+    //   conference.set_muted(MediaType::Video, true).await?;
+    // }
   }
   else {
     conference.set_muted(MediaType::Audio, true).await?;
@@ -609,133 +585,104 @@ async fn main_inner() -> Result<()> {
   });
 
   let conference3 = conference.clone();
-  let nick = nick.clone();
-  let token = opt.token.clone();
-  let room_name = opt.room_name.clone();
   tokio::spawn(async move {
-    loop {
-      // Wait until endpoint ID is available
-      let endpoint_id = loop {
-        match conference3.endpoint_id() {
-          Ok(id) => {
-            info!("Endpoint ID available: {}", id);
-            break id.to_string();
-          }
-          Err(_) => {
-            trace!("Waiting for endpoint ID to be available...");
-            tokio::time::sleep(Duration::from_millis(100)).await;
-          }
+    // Wait until endpoint ID is available
+    let endpoint_id = loop {
+      match conference3.endpoint_id() {
+        Ok(id) => {
+          info!("Endpoint ID available: {}", id);
+          break id.to_string();
         }
-      };
-      
-      // Connect to WebSocket
-      let ws_url = format!("wss://conference-dev.tellyo.com/notify-ws?token={}", token);
-      let (mut ws_sink, mut ws_stream) = match connect_async(ws_url.clone()).await {
-        Ok((ws_stream, _)) => {
-          info!("Connected to WebSocket at {}", ws_url.clone());
-          ws_stream.split()
+        Err(_) => {
+          trace!("Waiting for endpoint ID to be available...");
+          tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        Err(e) => {
-          error!("Failed to connect to WebSocket at {}: {}", ws_url, e);
-          tokio::time::sleep(Duration::from_secs(1)).await;
-          continue;
-        }
-      };
-      
-      // Create the JSON message
-      let message = InitMessage {
-        message_type: "init".to_string(),
-        data: InitData {
-          mic: false,
-          camera: true,
-          room: room_name.clone(),
-          display_name: nick.clone().to_string(),
-          endpoint_id: endpoint_id.clone(),
-          token: token.clone(),
-        },
-      };
-      
-      // Serialize to JSON
-      let json_message = match serde_json::to_string(&message) {
-        Ok(json) => json,
-        Err(e) => {
-          error!("Failed to serialize init message: {}", e);
-          tokio::time::sleep(Duration::from_secs(1)).await;
-          continue;
-        }
-      };
-      
-      // Set up interval for sending messages every second
-      let mut interval = interval(Duration::from_secs(1));
-      
-      // Send initial message
-      let message = Message::Text(json_message.clone());
-      if let Err(e) = ws_sink.send(message).await {
-        error!("Failed to send initial WebSocket message: {}", e);
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        continue;
       }
-      info!("Sent initial init message with endpoint ID {} to WebSocket", endpoint_id);
-      
-      // Keep connection alive and send periodic messages
-      loop {
-        tokio::select! {
-          // Send periodic messages
-          _ = interval.tick() => {
-            let message = StatsUpdateMessage {
-              message_type: "STATS_UPDATE".to_string(),
-              data: StatsUpdateData {
-                token: token.clone(),
-                stats: UserStats {
-                  audio: false,
-                  connection_quality: 100.0,
-                  endpoint_id: endpoint_id.clone(),
-                  is_production_muted: false,
-                  name: nick.clone(),
-                  room: room_name.clone(),
-                  screenshare: false,
-                  status: "active".to_string(),
-                  video: true,
-                  vssrc: 0,
-                }
-              },
-            };
-            let message = Message::Text(serde_json::to_string(&message).unwrap());
-            if let Err(e) = ws_sink.send(message).await {
-              error!("Failed to send update endpoint ID message: {}", e);
+    };
+    
+    // Connect to WebSocket
+    let ws_url = "wss://conference-dev.tellyo.com/new-notify-ws";
+    let (mut ws_sink, mut ws_stream) = match connect_async(ws_url).await {
+      Ok((ws_stream, _)) => {
+        info!("Connected to WebSocket at {}", ws_url);
+        ws_stream.split()
+      }
+      Err(e) => {
+        error!("Failed to connect to WebSocket at {}: {}", ws_url, e);
+        return;
+      }
+    };
+    
+    // Create the JSON message
+    let message = InitMessage {
+      message_type: "init".to_string(),
+      data: InitData {
+        mic: false,
+        camera: true,
+        room: opt.room_name.clone(),
+        display_name: "Alek1".to_string(),
+        endpoint_id: endpoint_id.clone(),
+        token: opt.token.clone(),
+      },
+    };
+    
+    // Serialize to JSON
+    let json_message = match serde_json::to_string(&message) {
+      Ok(json) => json,
+      Err(e) => {
+        error!("Failed to serialize init message: {}", e);
+        return;
+      }
+    };
+    
+    // Set up interval for sending messages every second
+    let mut interval = interval(Duration::from_secs(1));
+    
+    // Send initial message
+    let message = Message::Text(json_message.clone());
+    if let Err(e) = ws_sink.send(message).await {
+      error!("Failed to send initial WebSocket message: {}", e);
+      return;
+    }
+    info!("Sent initial init message with endpoint ID {} to WebSocket", endpoint_id);
+    
+    // Keep connection alive and send periodic messages
+    loop {
+      tokio::select! {
+        // Send periodic messages
+        _ = interval.tick() => {
+          let message = Message::Text(json_message.clone());
+          if let Err(e) = ws_sink.send(message).await {
+            error!("Failed to send periodic WebSocket message: {}", e);
+            break;
+          }
+          trace!("Sent periodic init message with endpoint ID {} to WebSocket", endpoint_id);
+        }
+        
+        // Handle incoming messages (optional - just to keep connection alive)
+        msg = ws_stream.next() => {
+          match msg {
+            Some(Ok(Message::Close(_))) => {
+              info!("WebSocket connection closed by server");
               break;
             }
-            trace!("Sent update endpoint ID message with endpoint ID {} to WebSocket", endpoint_id);
-          }
-          
-          // Handle incoming messages (optional - just to keep connection alive)
-          msg = ws_stream.next() => {
-            match msg {
-              Some(Ok(Message::Close(_))) => {
-                info!("WebSocket connection closed by server");
-                break;
-              }
-              Some(Ok(_)) => {
-                // Ignore other messages for now
-              }
-              Some(Err(e)) => {
-                error!("WebSocket error: {}", e);
-                break;
-              }
-              None => {
-                info!("WebSocket stream ended");
-                break;
-              }
+            Some(Ok(_)) => {
+              // Ignore other messages for now
+            }
+            Some(Err(e)) => {
+              error!("WebSocket error: {}", e);
+              break;
+            }
+            None => {
+              info!("WebSocket stream ended");
+              break;
             }
           }
         }
       }
-      
-      info!("WebSocket connection ended for endpoint ID: {}", endpoint_id);
-      
-      // Wait 1 second before respawning
-      tokio::time::sleep(Duration::from_secs(5)).await;
     }
+    
+    info!("WebSocket connection ended for endpoint ID: {}", endpoint_id);
   });
 /*
   let conference2 = conference.clone();
@@ -794,6 +741,141 @@ async fn main_inner() -> Result<()> {
   });
 */
   task::spawn_blocking(move || main_loop.run()).await?;
+
+  Ok(())
+}
+
+
+fn create_simulcast_bin() -> Result<gstreamer::Bin> {
+  let bin = gstreamer::Bin::new();
+
+  info!("Starting simulcast sender");
+
+  // Video source: live SMPTE test pattern at 1080p30.
+  let src = gstreamer::ElementFactory::make("videotestsrc")
+      .name("src")
+      .property("is-live", true)
+      .property_from_str("pattern", "smpte")
+      .build()
+      .map_err(|err| anyhow!("failed to create videotestsrc: {err}"))?;
+
+  let src_caps = gstreamer::Caps::builder("video/x-raw")
+      .field("width", 1920i32)
+      .field("height", 1080i32)
+      .field("framerate", gstreamer::Fraction::new(30, 1))
+      .build();
+
+  let src_capsfilter = gstreamer::ElementFactory::make("capsfilter")
+      .name("src_caps")
+      .property("caps", &src_caps)
+      .build()
+      .map_err(|err| anyhow!("failed to create src capsfilter: {err}"))?;
+
+  let tee = gstreamer::ElementFactory::make("tee")
+      .name("tee")
+      .build()
+      .map_err(|err| anyhow!("failed to create tee: {err}"))?;
+
+  bin
+      .add_many([&src, &src_capsfilter, &tee])
+      .map_err(|err| anyhow!("failed to add base elements: {err}"))?;
+  
+  gstreamer::Element::link_many([&src, &src_capsfilter, &tee])
+      .map_err(|err| anyhow!("failed to link source chain: {err}"))?;
+
+  // Build three simulcast branches (1080p, 720p, 360p).
+  add_simulcast_branch(
+      &bin, &tee, "1080p", 1920, 1080, 96, 0, false,
+  )?;
+  add_simulcast_branch(
+      &bin, &tee, "720p", 1280, 720, 97, 1, true,
+  )?;
+  add_simulcast_branch(
+      &bin, &tee, "360p", 640, 360, 98, 2, true,
+  )?;
+
+  Ok(bin)
+}
+
+fn add_simulcast_branch(
+  bin: &gstreamer::Bin,
+  tee: &gstreamer::Element,
+  label: &str,
+  width: i32,
+  height: i32,
+  payload_type: i32,
+  send_pad_index: u32,
+  needs_scale: bool,
+) -> Result<()> {
+  // Each branch produces one simulcast layer.
+  let queue = gstreamer::ElementFactory::make("queue")
+      .name(&format!("queue_{}", label))
+      .build()
+      .map_err(|err| anyhow!("failed to create queue for {label}: {err}"))?;
+
+  let mut elements: Vec<gstreamer::Element> = vec![queue.clone()];
+
+  info!("Creating simulcast branch for {label} with width {width}, height {height}, payload type {payload_type}, send pad index {send_pad_index}, needs scale {needs_scale}");
+
+  if needs_scale {
+      info!("Creating videoscale for {label}");
+      let videoscale = gstreamer::ElementFactory::make("videoscale")
+          .name(&format!("videoscale_{}", label))
+          .build()
+          .map_err(|err| anyhow!("failed to create videoscale for {label}: {err}"))?;
+      let caps = gstreamer::Caps::builder("video/x-raw")
+          .field("width", width)
+          .field("height", height)
+          .field("framerate", gstreamer::Fraction::new(30, 1))
+          .build();
+      let capsfilter = gstreamer::ElementFactory::make("capsfilter")
+          .name(&format!("caps_{}", label))
+          .property("caps", &caps)
+          .build()
+          .map_err(|err| anyhow!("failed to create branch capsfilter for {label}: {err}"))?;
+      elements.push(videoscale);
+      elements.push(capsfilter);
+  }
+
+  info!("Creating vp8enc for {label}");
+  let vp8enc = gstreamer::ElementFactory::make("vp8enc")
+      .name(&format!("vp8enc_{}", label))
+      .property("threads", 8i32)
+      .property("deadline", 1i64) // real-time
+      .property("cpu-used", 8i32)
+      .property("keyframe-max-dist", 30i32)
+      .build()
+      .map_err(|err| anyhow!("failed to create vp8enc for {label}: {err}"))?;
+  
+  let vp8enc_queue = gstreamer::ElementFactory::make("queue")
+      .name(&format!("vp8enc_queue_{}", label))
+      .build()
+      .map_err(|err| anyhow!("failed to create queue for {label}: {err}"))?;
+
+  elements.push(vp8enc);
+  elements.push(vp8enc_queue);
+  bin
+      .add_many(elements.iter())
+      .map_err(|err| anyhow!("failed to add branch elements for {label}: {err}"))?;
+
+  gstreamer::Element::link_many(&elements)
+      .map_err(|err| anyhow!("failed to link branch for {label}: {err}"))?;
+
+  // Link tee -> branch queue.
+  let tee_pad = tee
+      .request_pad_simple("src_%u")
+      .ok_or_else(|| anyhow!("failed to request tee pad for {label}"))?;
+  let queue_sink = queue
+      .static_pad("sink")
+      .context("queue sink pad missing")?;
+  tee_pad
+      .link(&queue_sink)
+      .map_err(|err| anyhow!("failed to link tee to queue for {label}: {err}"))?;
+
+  info!(
+      "Linked simulcast layer {} ({}x{}, PT {}, send_rtp_sink_{})",
+      label, width, height, payload_type, send_pad_index
+  );
 
   Ok(())
 }

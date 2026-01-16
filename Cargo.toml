@@ -9,5 +9,6 @@ members = [
   "jitsi-xmpp-parsers",
   "guest-return",
   "guest-simulator",
+  "simulcast",
 ]
 

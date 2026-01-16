@@ -435,6 +435,18 @@ impl JitsiConference {
     )
   }
 
+  pub async fn video_sink_elements(&self) -> Result<Vec<gstreamer::Element>> {
+    Ok(
+      self
+        .jingle_session
+        .lock()
+        .await
+        .as_ref()
+        .context("not connected (no jingle session)")?
+        .video_sink_elements(),
+    )
+  }
+
   /// Set the max resolution that we are currently sending.
   ///
   /// Setting this is required for browser clients in the same conference to display

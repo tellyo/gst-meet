@@ -407,8 +407,8 @@ async fn main_inner() -> Result<()> {
 
     if let Some(video) = bin.by_name("video") {
       info!("Found video element in pipeline, linking...");
-      let video_sink = conference.video_sink_element().await?;
-      video.link(&video_sink)?;
+      let video_sinks = conference.video_sink_elements().await?;
+      video.link(&video_sinks[0])?;
     }
     else {
       conference.set_muted(MediaType::Video, true).await?;

@@ -3424,8 +3424,6 @@ dependencies = [
 [[package]]
 name = "xmpp-parsers"
 version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0905d294e6e7f7668f4b3ca9c4a6343fd85355d21c44d2f1c8b1c027394048e"
 dependencies = [
  "base64 0.21.7",
  "blake2",

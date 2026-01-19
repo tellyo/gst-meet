@@ -52,7 +52,8 @@ tracing-subscriber = { version = "0.3", optional = true, default-features = fals
 ] }
 uuid = { version = "1", default-features = false, features = ["v4"] }
 webpki-roots = { version = "0.26", default-features = false, optional = true }
-xmpp-parsers = { version = "0.20", default-features = false, features = ["disable-validation"] }
+# xmpp-parsers = { version = "0.20", default-features = false, features = ["disable-validation"] }
+xmpp-parsers = { version = "0.20", path = "../xmpp-rs/parsers", default-features = false, features = ["disable-validation"] }
 
 [features]
 # Ideally we would enable rustls/dangerous_configuration only when tls-insecure is enabled, but until weak-dep-features is stabilised, that

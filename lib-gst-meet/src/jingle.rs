@@ -1390,7 +1390,9 @@ impl JingleSession {
         let source_name = format!("{endpoint_id}-v0");
         vec![
           jingle_ssma::Source::new(video_ssrc, Some(source_name.clone()), Some("camera".into())),
-          jingle_ssma::Source::new(video_rtx_ssrc, Some(source_name), Some("camera".into())),
+          jingle_ssma::Source::new(video_rtx_ssrc, Some(source_name.clone()), Some("camera".into())),
+          jingle_ssma::Source::new(video_ssrc+1, Some(source_name.clone()), Some("camera".into())),
+          jingle_ssma::Source::new(video_ssrc+2, Some(source_name.clone()), Some("camera".into())),
         ]
       };
 
@@ -1411,7 +1413,17 @@ impl JingleSession {
             jingle_ssma::Source::new(video_ssrc, None, None),
             jingle_ssma::Source::new(video_rtx_ssrc, None, None),
           ],
-        }]
+        },
+        jingle_ssma::Group {
+          semantics: Semantics::Sim,
+          sources: vec![
+            jingle_ssma::Source::new(video_ssrc, None, None),
+            jingle_ssma::Source::new(video_ssrc+1, None, None),
+            jingle_ssma::Source::new(video_ssrc+2, None, None),
+            //jingle_ssma::Source::new(video_rtx_ssrc, None, None),
+          ],
+        },
+        ]
       };
 
       if initiate_content.name.0 == "audio" {

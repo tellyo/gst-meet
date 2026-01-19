@@ -408,17 +408,17 @@ async fn main_inner() -> Result<()> {
 
     let video_sinks = conference.video_sink_elements().await?;
     // add all those three queues to the bin
-    if let Some(queue) = bin.by_name("queue_1080p") {
+    if let Some(queue) = bin.by_name("vp8enc_queue_1080p") {
       info!("Found video 1080p element in pipeline, linking...");
       queue.link(&video_sinks[0])?;
     }
 
-    if let Some(queue) = bin.by_name("queue_720p") {
+    if let Some(queue) = bin.by_name("vp8enc_queue_720p") {
       info!("Found video 720p element in pipeline, linking...");
       queue.link(&video_sinks[1])?;
     }
 
-    if let Some(queue) = bin.by_name("queue_360p") {
+    if let Some(queue) = bin.by_name("vp8enc_queue_360p") {
       info!("Found video 360p element in pipeline, linking...");
       queue.link(&video_sinks[2])?;
     }
@@ -785,13 +785,13 @@ fn create_simulcast_bin() -> Result<gstreamer::Bin> {
 
   // Build three simulcast branches (1080p, 720p, 360p).
   add_simulcast_branch(
-      &bin, &tee, "1080p", 1920, 1080, 96, 0, false,
+      &bin, &tee, "1080p", 1920, 1080, 96, 0, false, 3000,
   )?;
   add_simulcast_branch(
-      &bin, &tee, "720p", 1280, 720, 97, 1, true,
+      &bin, &tee, "720p", 1280, 720, 97, 1, true, 1500,
   )?;
   add_simulcast_branch(
-      &bin, &tee, "360p", 640, 360, 98, 2, true,
+      &bin, &tee, "360p", 640, 360, 98, 2, true, 750,
   )?;
 
   Ok(bin)
@@ -806,6 +806,7 @@ fn add_simulcast_branch(
   payload_type: i32,
   send_pad_index: u32,
   needs_scale: bool,
+  bitrate: i32
 ) -> Result<()> {
   // Each branch produces one simulcast layer.
   let queue = gstreamer::ElementFactory::make("queue")
@@ -841,9 +842,15 @@ fn add_simulcast_branch(
   let vp8enc = gstreamer::ElementFactory::make("vp8enc")
       .name(&format!("vp8enc_{}", label))
       .property("threads", 8i32)
-      .property("deadline", 1i64) // real-time
+      .property("deadline", 2i64) // real-time
       .property("cpu-used", 8i32)
+      .property("end-usage", GstVPXEncEndUsage::Cbr)
       .property("keyframe-max-dist", 30i32)
+      .property("buffer-initial-size", 500i32)
+      .property("buffer-optimal-size", 500i32)
+      .property("buffer-size", 500i32)
+      .property("lag-in-frames", 1i32)
+      .property("target-bitrate", bitrate)
       .build()
       .map_err(|err| anyhow!("failed to create vp8enc for {label}: {err}"))?;
   

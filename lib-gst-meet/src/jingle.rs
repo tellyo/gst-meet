@@ -53,11 +53,14 @@ use crate::{
 const RTP_HDREXT_SSRC_AUDIO_LEVEL: &str = "urn:ietf:params:rtp-hdrext:ssrc-audio-level";
 const RTP_HDREXT_TRANSPORT_CC: &str =
   "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01";
+const RTP_HDREXT_ABS_SEND_TIME: &str = "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time";
+const RTP_HDREXT_RTP_STREAM_ID: &str = "urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id";
+const RTP_HDREXT_RTP_MEDIA_ID: &str = "urn:ietf:params:rtp-hdrext:sdes:mid";
 
 const DEFAULT_STUN_PORT: u16 = 3478;
 const DEFAULT_TURNS_PORT: u16 = 5349;
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 enum CodecName {
   Opus,
   H264,
@@ -66,7 +69,7 @@ enum CodecName {
   Av1,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Codec {
   name: CodecName,
   pt: u8,
@@ -554,12 +557,16 @@ impl JingleSession {
     debug!("Local DTLS fingerprint: {}", fingerprint_str);
 
     let audio_ssrc: u32 = random();
-    let video_ssrc: u32 = random();
-    let video_rtx_ssrc: u32 = random();
+    let video_ssrc0: u32 = random();
+    let video_ssrc1: u32 = video_ssrc0 + 1;
+    let video_ssrc2: u32 = video_ssrc0 + 2;
+    let video_rtx_ssrc0: u32 = random();
+    let video_rtx_ssrc1: u32 = video_rtx_ssrc0 + 1;
+    let video_rtx_ssrc2: u32 = video_rtx_ssrc0 + 2;
 
     debug!("audio SSRC: {}", audio_ssrc);
-    debug!("video SSRC: {}", video_ssrc);
-    debug!("video RTX SSRC: {}", video_rtx_ssrc);
+    debug!("video SSRC: {}", video_ssrc0);
+    debug!("video RTX SSRC: {}", video_rtx_ssrc0);
 
     let (ice_agent, ice_stream_id, ice_component_id) =
       JingleSession::setup_ice(conference, ice_transport).await?;
@@ -618,7 +625,7 @@ impl JingleSession {
       let codecs = codecs.clone();
       rtpbin.connect("request-pt-map", false, move |values| {
         let f = || {
-          debug!("rtpbin request-pt-map {:?}", values);
+          debug!("rtpbin  {:?}", values);
           let pt = values[2].get::<u32>()? as u8;
           let mut caps = gstreamer::Caps::builder("application/x-rtp").field("payload", pt as i32);
           for codec in codecs.iter() {
@@ -641,7 +648,9 @@ impl JingleSession {
                   .field("media", "video")
                   .field("clock-rate", 90000)
                   .field("encoding-name", codec.encoding_name())
-                  .field("rtcp-fb-nack-pli", true);
+                  .field("rtcp-fb-nack-pli", true)
+                  .field("extmap-sdes:rtp-stream-id", RTP_HDREXT_RTP_STREAM_ID)
+                  .field("extmap-sdes:mid", RTP_HDREXT_RTP_MEDIA_ID);
                 if let Some(hdrext) = video_hdrext_transport_cc {
                   caps = caps.field(&format!("extmap-{}", hdrext), RTP_HDREXT_TRANSPORT_CC);
                 }
@@ -729,6 +738,8 @@ impl JingleSession {
       .collect();
     {
       let pts = pts.clone();
+      info!("codecs: {:?}", codecs.clone());
+      info!("pts: {:?}", pts.clone());
       rtpbin.connect("request-aux-sender", false, move |values| {
         let f = || {
           let session: u32 = values[1].get()?;
@@ -738,7 +749,10 @@ impl JingleSession {
           for (pt, rtx_pt) in pts.iter() {
             pt_map = pt_map.field(pt, rtx_pt);
           }
-          ssrc_map = ssrc_map.field(&video_ssrc.to_string(), &(video_rtx_ssrc as u32));
+          ssrc_map = ssrc_map
+          .field(&video_ssrc0.to_string(), &(video_rtx_ssrc0 as u32))
+          .field(&(video_ssrc1).to_string(), &(video_rtx_ssrc1 as u32))
+          .field(&(video_ssrc2).to_string(), &(video_rtx_ssrc2 as u32));
           let bin = gstreamer::Bin::new();
           let rtx_sender = gstreamer::ElementFactory::make("rtprtxsend")
             .property("payload-type-map", pt_map.build())
@@ -1176,7 +1190,7 @@ impl JingleSession {
     for i in 0..3 {
       let video_sink_element = JingleSession::create_video_sink_element(
         conference.config.video_codec.as_str(),
-        &codecs, video_ssrc+i as u32)?;
+        &codecs, video_ssrc0+i as u32)?;
       pipeline.add(&video_sink_element)?;
       debug!("linking video payloader -> rtpfunnel");
       video_sink_element.link(&rtpfunnel)?;
@@ -1376,7 +1390,7 @@ impl JingleSession {
         audio_ssrc.to_string()
       }
       else {
-        video_ssrc.to_string()
+        video_ssrc0.to_string()
       });
 
       description.ssrcs = if initiate_content.name.0 == "audio" {
@@ -1389,10 +1403,12 @@ impl JingleSession {
       else {
         let source_name = format!("{endpoint_id}-v0");
         vec![
-          jingle_ssma::Source::new(video_ssrc, Some(source_name.clone()), Some("camera".into())),
-          jingle_ssma::Source::new(video_rtx_ssrc, Some(source_name.clone()), Some("camera".into())),
-          jingle_ssma::Source::new(video_ssrc+1, Some(source_name.clone()), Some("camera".into())),
-          jingle_ssma::Source::new(video_ssrc+2, Some(source_name.clone()), Some("camera".into())),
+          jingle_ssma::Source::new(video_ssrc0, Some(source_name.clone()), Some("camera".into())),
+          jingle_ssma::Source::new(video_rtx_ssrc0, Some(source_name.clone()), Some("camera".into())),
+          jingle_ssma::Source::new(video_ssrc1, Some(source_name.clone()), Some("camera".into())),
+          jingle_ssma::Source::new(video_rtx_ssrc1, Some(source_name.clone()), Some("camera".into())),
+          jingle_ssma::Source::new(video_ssrc2, Some(source_name.clone()), Some("camera".into())),
+          jingle_ssma::Source::new(video_rtx_ssrc2, Some(source_name.clone()), Some("camera".into())),
         ]
       };
 
@@ -1407,24 +1423,40 @@ impl JingleSession {
         vec![]
       }
       else {
-        vec![jingle_ssma::Group {
+        vec![
+          jingle_ssma::Group {
           semantics: Semantics::Fid,
           sources: vec![
-            jingle_ssma::Source::new(video_ssrc, None, None),
-            jingle_ssma::Source::new(video_rtx_ssrc, None, None),
+            jingle_ssma::Source::new(video_ssrc0, None, None),
+            jingle_ssma::Source::new(video_rtx_ssrc0, None, None),
+          ],
+        },
+          jingle_ssma::Group {
+          semantics: Semantics::Fid,
+          sources: vec![
+            jingle_ssma::Source::new(video_ssrc1, None, None),
+            jingle_ssma::Source::new(video_rtx_ssrc1, None, None),
+          ],
+        },
+          jingle_ssma::Group {
+          semantics: Semantics::Fid,
+          sources: vec![
+            jingle_ssma::Source::new(video_ssrc2, None, None),
+            jingle_ssma::Source::new(video_rtx_ssrc2, None, None),
           ],
         },
         jingle_ssma::Group {
           semantics: Semantics::Sim,
           sources: vec![
-            jingle_ssma::Source::new(video_ssrc, None, None),
-            jingle_ssma::Source::new(video_ssrc+1, None, None),
-            jingle_ssma::Source::new(video_ssrc+2, None, None),
+            jingle_ssma::Source::new(video_ssrc0, None, None),
+            jingle_ssma::Source::new(video_ssrc1, None, None),
+            jingle_ssma::Source::new(video_ssrc2, None, None),
             //jingle_ssma::Source::new(video_rtx_ssrc, None, None),
           ],
         },
         ]
       };
+
 
       if initiate_content.name.0 == "audio" {
         if let Some(hdrext) = audio_hdrext_ssrc_audio_level {
@@ -1445,6 +1477,8 @@ impl JingleSession {
             .hdrexts
             .push(RtpHdrext::new(hdrext, RTP_HDREXT_TRANSPORT_CC.to_owned()));
         }
+
+        description.hdrexts.push(RtpHdrext::new(3, RTP_HDREXT_ABS_SEND_TIME.to_owned()));
       }
 
       let mut transport = IceUdpTransport::new().with_fingerprint(Fingerprint {

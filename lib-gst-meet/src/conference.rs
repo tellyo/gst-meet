@@ -909,7 +909,7 @@ impl JitsiConference {
                 if let (Some(remote_ssrc_map), Some(source_stats)) =
                   (maybe_remote_ssrc_map, maybe_source_stats)
                 {
-                  debug!("source stats: {:#?}", source_stats);
+                  //debug!("source stats: {:#?}", source_stats);
 
                   let audio_recv_bitrate = get_audio_recv_bitrate(&source_stats, &my_endpoint_id, &remote_ssrc_map);
                   let video_recv_bitrate = get_video_recv_bitrate(&source_stats, &my_endpoint_id, &remote_ssrc_map);

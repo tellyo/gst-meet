@@ -760,8 +760,8 @@ fn create_simulcast_bin() -> Result<gstreamer::Bin> {
       .map_err(|err| anyhow!("failed to create videotestsrc: {err}"))?;
 
   let src_caps = gstreamer::Caps::builder("video/x-raw")
-      .field("width", 1920i32)
-      .field("height", 1080i32)
+      .field("width", 1280i32)
+      .field("height", 720i32)
       .field("framerate", gstreamer::Fraction::new(30, 1))
       .build();
 
@@ -785,13 +785,13 @@ fn create_simulcast_bin() -> Result<gstreamer::Bin> {
 
   // Build three simulcast branches (1080p, 720p, 360p).
   add_simulcast_branch(
-      &bin, &tee, "1080p", 1920, 1080, 96, 0, false, 3000,
+      &bin, &tee, "1080p", 1280, 720, 100, 0, false, 3000,
   )?;
   add_simulcast_branch(
-      &bin, &tee, "720p", 1280, 720, 97, 1, true, 1500,
+      &bin, &tee, "720p", 640, 360, 100, 1, true, 1500,
   )?;
   add_simulcast_branch(
-      &bin, &tee, "360p", 640, 360, 98, 2, true, 750,
+      &bin, &tee, "360p", 320, 180, 100, 2, true, 750,
   )?;
 
   Ok(bin)
@@ -844,7 +844,7 @@ fn add_simulcast_branch(
       .property("threads", 8i32)
       .property("deadline", 2i64) // real-time
       .property("cpu-used", 8i32)
-      .property("end-usage", GstVPXEncEndUsage::Cbr)
+      .property_from_str("end-usage", "cbr")
       .property("keyframe-max-dist", 30i32)
       .property("buffer-initial-size", 500i32)
       .property("buffer-optimal-size", 500i32)

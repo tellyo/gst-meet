@@ -1182,12 +1182,12 @@ impl JingleSession {
     }
     pipeline.add(&audio_sink_element)?;
 
-    let rtpfunnel = gstreamer::ElementFactory::make("rtpfunnel").build()?;
-    pipeline.add(&rtpfunnel)?;
-
     // create three video sinks
     let mut video_sink_elements = vec![];
     for i in 0..3 {
+      let rtpfunnel = gstreamer::ElementFactory::make("rtpfunnel").build()?;
+      pipeline.add(&rtpfunnel)?;
+
       let video_sink_element = JingleSession::create_video_sink_element(
         conference.config.video_codec.as_str(),
         &codecs, video_ssrc0+i as u32)?;
@@ -1195,20 +1195,33 @@ impl JingleSession {
       debug!("linking video payloader -> rtpfunnel");
       video_sink_element.link(&rtpfunnel)?;
       video_sink_elements.push(video_sink_element);
+
+      if i == 0 {
+        debug!("linking audio payloader -> rtpfunnel");
+        audio_sink_element.link(&rtpfunnel)?;
+      }
+
+      let send_pad = format!("send_rtp_sink_{}", i);
+      debug!("linking rtpfunnel -> rtpbin: {}", send_pad);
+      let rtpbin_sink_pad = rtpbin
+        .request_pad_simple(send_pad.as_str())
+        .context("failed to request rtpbin send_rtp_sink pad")?;
+      let rtpfunnel_src_pad = rtpfunnel
+        .static_pad("src")
+        .context("failed to get rtpfunnel src pad")?;
+      rtpfunnel_src_pad.link(&rtpbin_sink_pad)?;
     }
-
-    debug!("linking audio payloader -> rtpfunnel");
-    audio_sink_element.link(&rtpfunnel)?;
-
-    debug!("linking rtpfunnel -> rtpbin");
-    rtpfunnel.link_pads(None, &rtpbin, Some("send_rtp_sink_0"))?;
 
     let rtp_recv_identity = gstreamer::ElementFactory::make("identity").build()?;
     pipeline.add(&rtp_recv_identity)?;
     let rtcp_recv_identity = gstreamer::ElementFactory::make("identity").build()?;
     pipeline.add(&rtcp_recv_identity)?;
-    let rtp_send_identity = gstreamer::ElementFactory::make("identity").build()?;
-    pipeline.add(&rtp_send_identity)?;
+    let rtp_send_identity0 = gstreamer::ElementFactory::make("identity").build()?;
+    pipeline.add(&rtp_send_identity0)?;
+    let rtp_send_identity1 = gstreamer::ElementFactory::make("identity").build()?;
+    pipeline.add(&rtp_send_identity1)?;
+    let rtp_send_identity2 = gstreamer::ElementFactory::make("identity").build()?;
+    pipeline.add(&rtp_send_identity2)?;
     let rtcp_send_identity = gstreamer::ElementFactory::make("identity").build()?;
     pipeline.add(&rtcp_send_identity)?;
 
@@ -1280,8 +1293,17 @@ impl JingleSession {
     rtcp_recv_identity.link_pads(None, &rtpbin, Some("recv_rtcp_sink_0"))?;
 
     debug!("linking rtpbin -> dtlssrtpenc");
-    rtpbin.link_pads(Some("send_rtp_src_0"), &rtp_send_identity, None)?;
-    rtp_send_identity.link_pads(None, &dtlssrtpenc, Some("rtp_sink_0"))?;
+    rtpbin.link_pads(Some("send_rtp_src_0"), &rtp_send_identity0, None)?;
+    rtp_send_identity0.link_pads(None, &dtlssrtpenc, Some("rtp_sink_0"))?;
+
+    rtpbin.link_pads(Some("send_rtp_src_1"), &rtp_send_identity1, None)?;
+    rtp_send_identity1.link_pads(None, &dtlssrtpenc, Some("rtp_sink_1"))?;
+    
+    rtpbin.link_pads(Some("send_rtp_src_2"), &rtp_send_identity2, None)?;
+    rtp_send_identity2.link_pads(None, &dtlssrtpenc, Some("rtp_sink_2"))?;
+
+
+
     rtpbin.link_pads(Some("send_rtcp_src_0"), &rtcp_send_identity, None)?;
     rtcp_send_identity.link_pads(None, &dtlssrtpenc, Some("rtcp_sink_0"))?;
 

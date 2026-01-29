@@ -408,17 +408,17 @@ async fn main_inner() -> Result<()> {
 
     let video_sinks = conference.video_sink_elements().await?;
     // add all those three queues to the bin
-    if let Some(queue) = bin.by_name("vp8enc_queue_1080p") {
+    if let Some(queue) = bin.by_name("vp8enc_queue_low") {
       info!("Found video 1080p element in pipeline, linking...");
       queue.link(&video_sinks[0])?;
     }
 
-    if let Some(queue) = bin.by_name("vp8enc_queue_720p") {
+    if let Some(queue) = bin.by_name("vp8enc_queue_medium") {
       info!("Found video 720p element in pipeline, linking...");
       queue.link(&video_sinks[1])?;
     }
 
-    if let Some(queue) = bin.by_name("vp8enc_queue_360p") {
+    if let Some(queue) = bin.by_name("vp8enc_queue_high") {
       info!("Found video 360p element in pipeline, linking...");
       queue.link(&video_sinks[2])?;
     }
@@ -785,13 +785,13 @@ fn create_simulcast_bin() -> Result<gstreamer::Bin> {
 
   // Build three simulcast branches (1080p, 720p, 360p).
   add_simulcast_branch(
-      &bin, &tee, "1080p", 1280, 720, 100, 0, false, 3000,
+      &bin, &tee, "low", 320, 180, 100, 2, true, 750,
   )?;
   add_simulcast_branch(
-      &bin, &tee, "720p", 640, 360, 100, 1, true, 1500,
+      &bin, &tee, "medium", 640, 360, 100, 1, true, 1500,
   )?;
   add_simulcast_branch(
-      &bin, &tee, "360p", 320, 180, 100, 2, true, 750,
+      &bin, &tee, "high", 1280, 720, 100, 0, false, 3000,
   )?;
 
   Ok(bin)

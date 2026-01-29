@@ -648,9 +648,9 @@ impl JingleSession {
                   .field("media", "video")
                   .field("clock-rate", 90000)
                   .field("encoding-name", codec.encoding_name())
-                  .field("rtcp-fb-nack-pli", true)
-                  .field("extmap-sdes:rtp-stream-id", RTP_HDREXT_RTP_STREAM_ID)
-                  .field("extmap-sdes:mid", RTP_HDREXT_RTP_MEDIA_ID);
+                  .field("rtcp-fb-nack-pli", true);
+                  //.field("extmap-sdes:rtp-stream-id", RTP_HDREXT_RTP_STREAM_ID)
+                  //.field("extmap-sdes:mid", RTP_HDREXT_RTP_MEDIA_ID);
                 if let Some(hdrext) = video_hdrext_transport_cc {
                   caps = caps.field(&format!("extmap-{}", hdrext), RTP_HDREXT_TRANSPORT_CC);
                 }

@@ -755,7 +755,7 @@ fn create_simulcast_bin() -> Result<gstreamer::Bin> {
   let src = gstreamer::ElementFactory::make("videotestsrc")
       .name("src")
       .property("is-live", true)
-      .property_from_str("pattern", "smpte")
+      .property_from_str("pattern", "smpte100")
       .build()
       .map_err(|err| anyhow!("failed to create videotestsrc: {err}"))?;
 
@@ -771,16 +771,38 @@ fn create_simulcast_bin() -> Result<gstreamer::Bin> {
       .build()
       .map_err(|err| anyhow!("failed to create src capsfilter: {err}"))?;
 
+  // timecodestamper ! \
+  // clockoverlay ! \
+  // timeoverlay valignment=center halignment=center time-mode=time-code ! \
+
+  let timecodestamper = gstreamer::ElementFactory::make("timecodestamper")
+      .name("timecodestamper")
+      .build()
+      .map_err(|err| anyhow!("failed to create timecodestamper: {err}"))?;
+
+  let clockoverlay = gstreamer::ElementFactory::make("clockoverlay")
+      .name("clockoverlay")
+      .build()
+      .map_err(|err| anyhow!("failed to create clockoverlay: {err}"))?;
+
+  let timeoverlay = gstreamer::ElementFactory::make("timeoverlay")
+      .name("timeoverlay")
+      .property("valignment", 4)
+      .property("halignment", 4)
+      .property("time-mode", "time-code")
+      .build()
+      .map_err(|err| anyhow!("failed to create timeoverlay: {err}"))?;
+
   let tee = gstreamer::ElementFactory::make("tee")
       .name("tee")
       .build()
       .map_err(|err| anyhow!("failed to create tee: {err}"))?;
 
   bin
-      .add_many([&src, &src_capsfilter, &tee])
+      .add_many([&src, &src_capsfilter, &timecodestamper, &clockoverlay, &timeoverlay, &tee])
       .map_err(|err| anyhow!("failed to add base elements: {err}"))?;
   
-  gstreamer::Element::link_many([&src, &src_capsfilter, &tee])
+  gstreamer::Element::link_many([&src, &src_capsfilter, &timecodestamper, &clockoverlay, &timeoverlay, &tee])
       .map_err(|err| anyhow!("failed to link source chain: {err}"))?;
 
   // Build three simulcast branches (1080p, 720p, 360p).

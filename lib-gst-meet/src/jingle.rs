@@ -302,6 +302,54 @@ impl JingleSession {
     Ok(())
   }
 
+  fn build_aux_sender_bin(
+    values: &[glib::Value],
+    pts: &[(String, u32)],
+    video_ssrc0: u32,
+    video_ssrc1: u32,
+    video_ssrc2: u32,
+    video_rtx_ssrc0: u32,
+    video_rtx_ssrc1: u32,
+    video_rtx_ssrc2: u32,
+  ) -> Result<glib::Value> {
+    let session: u32 = values[1].get()?;
+    debug!("creating RTX sender for session {}", session);
+    let mut pt_map = gstreamer::Structure::builder("application/x-rtp-pt-map");
+    let mut ssrc_map = gstreamer::Structure::builder("application/x-rtp-ssrc-map");
+    for (pt, rtx_pt) in pts.iter() {
+      pt_map = pt_map.field(pt, rtx_pt);
+    }
+    ssrc_map = ssrc_map
+      .field(&video_ssrc0.to_string(), &(video_rtx_ssrc0 as u32))
+      .field(&(video_ssrc1).to_string(), &(video_rtx_ssrc1 as u32))
+      .field(&(video_ssrc2).to_string(), &(video_rtx_ssrc2 as u32));
+    let bin = gstreamer::Bin::new();
+    let rtx_sender = gstreamer::ElementFactory::make("rtprtxsend")
+      .property("payload-type-map", pt_map.build())
+      .property("ssrc-map", ssrc_map.build())
+      .build()?;
+    bin.add(&rtx_sender)?;
+    bin.add_pad(
+      &gstreamer::GhostPad::builder_with_target(
+        &rtx_sender
+          .static_pad("src")
+          .context("rtprtxsend has no src pad")?,
+      )?
+      .name(format!("src_{}", session))
+      .build(),
+    )?;
+    bin.add_pad(
+      &gstreamer::GhostPad::builder_with_target(
+        &rtx_sender
+          .static_pad("sink")
+          .context("rtprtxsend has no sink pad")?,
+      )?
+      .name(format!("sink_{}", session))
+      .build(),
+    )?;
+    Ok(bin.to_value())
+  }
+
   fn parse_rtp_description(
     description: &RtpDescription,
     remote_ssrc_map: &mut HashMap<u32, Source>,
@@ -769,46 +817,17 @@ impl JingleSession {
       info!("codecs: {:?}", codecs.clone());
       info!("pts: {:?}", pts.clone());
       rtpbin.connect("request-aux-sender", false, move |values| {
-        let f = || {
-          let session: u32 = values[1].get()?;
-          debug!("creating RTX sender for session {}", session);
-          let mut pt_map = gstreamer::Structure::builder("application/x-rtp-pt-map");
-          let mut ssrc_map = gstreamer::Structure::builder("application/x-rtp-ssrc-map");
-          for (pt, rtx_pt) in pts.iter() {
-            pt_map = pt_map.field(pt, rtx_pt);
-          }
-          ssrc_map = ssrc_map
-          .field(&video_ssrc0.to_string(), &(video_rtx_ssrc0 as u32))
-          .field(&(video_ssrc1).to_string(), &(video_rtx_ssrc1 as u32))
-          .field(&(video_ssrc2).to_string(), &(video_rtx_ssrc2 as u32));
-          let bin = gstreamer::Bin::new();
-          let rtx_sender = gstreamer::ElementFactory::make("rtprtxsend")
-            .property("payload-type-map", pt_map.build())
-            .property("ssrc-map", ssrc_map.build())
-            .build()?;
-          bin.add(&rtx_sender)?;
-          bin.add_pad(
-            &gstreamer::GhostPad::builder_with_target(
-              &rtx_sender
-                .static_pad("src")
-                .context("rtprtxsend has no src pad")?,
-            )?
-            .name(format!("src_{}", session))
-            .build(),
-          )?;
-          bin.add_pad(
-            &gstreamer::GhostPad::builder_with_target(
-              &rtx_sender
-                .static_pad("sink")
-                .context("rtprtxsend has no sink pad")?,
-            )?
-            .name(format!("sink_{}", session))
-            .build(),
-          )?;
-          Ok::<_, anyhow::Error>(Some(bin.to_value()))
-        };
-        match f() {
-          Ok(o) => o,
+        match JingleSession::build_aux_sender_bin(
+          values,
+          &pts,
+          video_ssrc0,
+          video_ssrc1,
+          video_ssrc2,
+          video_rtx_ssrc0,
+          video_rtx_ssrc1,
+          video_rtx_ssrc2,
+        ) {
+          Ok(value) => Some(value),
           Err(e) => {
             warn!("request-aux-sender: {:?}", e);
             None

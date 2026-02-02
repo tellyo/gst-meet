@@ -4,9 +4,15 @@ use anyhow::{anyhow, bail, Context, Result};
 #[cfg(target_os = "macos")]
 use cocoa::appkit::NSApplication;
 use colibri::{ColibriMessage, Constraints, VideoType};
-use glib::object::ObjectExt as _;
+use glib::{
+  object::ObjectExt as _,
+  prelude::ToValue,
+  translate::{from_glib, ToGlibPtr, ToGlibPtrMut},
+};
 use gstreamer::{
-  GhostPad, prelude::{ElementExt as _, ElementExtManual, GstBinExt as _, GstBinExtManual, PadExt}
+  GhostPad,
+  ffi,
+  prelude::{ElementExt as _, ElementExtManual, GstBinExt as _, GstBinExtManual, PadExt},
 };
 use http::Uri;
 use lib_gst_meet::{
@@ -787,9 +793,9 @@ fn create_simulcast_bin() -> Result<gstreamer::Bin> {
 
   let timeoverlay = gstreamer::ElementFactory::make("timeoverlay")
       .name("timeoverlay")
-      .property("valignment", 4)
-      .property("halignment", 4)
-      .property("time-mode", "time-code")
+      .property_from_str("valignment", "center")
+      .property_from_str("halignment", "center")
+      .property_from_str("time-mode", "time-code")
       .build()
       .map_err(|err| anyhow!("failed to create timeoverlay: {err}"))?;
 
@@ -817,6 +823,18 @@ fn create_simulcast_bin() -> Result<gstreamer::Bin> {
   )?;
 
   Ok(bin)
+}
+
+fn gst_value_array(values: impl IntoIterator<Item = glib::Value>) -> glib::Value {
+  let value_type = unsafe { from_glib(ffi::gst_value_array_get_type()) };
+  let mut value = glib::Value::from_type(value_type);
+  for v in values {
+      let mut v = v.into_raw();
+      unsafe {
+          ffi::gst_value_array_append_and_take_value(value.to_glib_none_mut().0, &mut v);
+      }
+  }
+  value
 }
 
 fn add_simulcast_branch(
@@ -861,6 +879,38 @@ fn add_simulcast_branch(
   }
 
   info!("Creating vp8enc for {label}");
+  // temporal-scalability-number-layers=3
+  // temporal-scalability-periodicity=4
+  // temporal-scalability-layer-id="1,2,3"
+  // temporal-scalability-layer-sync-flags="false,false,false,true"
+  // temporal-scalability-rate-decimator="1,2,4"
+  // temporal-scalability-target-bitrate="500000,1000000,1500000"
+
+  // must be GValueArray
+  let mut temporal_layer_ids = glib::ValueArray::new(3);
+      temporal_layer_ids.append(&1i32.into());
+      temporal_layer_ids.append(&2i32.into());
+      temporal_layer_ids.append(&3i32.into());
+
+  let temporal_layer_sync_flags = gst_value_array([
+      false.to_value(),
+      false.to_value(),
+      false.to_value(),
+      true.to_value(),
+  ]);
+
+  // GValueArray
+  let mut temporal_rate_decimator = glib::ValueArray::new(3);
+      temporal_rate_decimator.append(&4i32.into());
+      temporal_rate_decimator.append(&2i32.into());
+      temporal_rate_decimator.append(&1i32.into());
+
+  // GValueArray
+  let mut temporal_target_bitrate = glib::ValueArray::new(3);
+      temporal_target_bitrate.append(&(bitrate).into());
+      temporal_target_bitrate.append(&(bitrate * 2).into());
+      temporal_target_bitrate.append(&(bitrate * 4).into());
+
   let vp8enc = gstreamer::ElementFactory::make("vp8enc")
       .name(&format!("vp8enc_{}", label))
       .property("threads", 8i32)
@@ -873,6 +923,12 @@ fn add_simulcast_branch(
       .property("buffer-size", 500i32)
       .property("lag-in-frames", 1i32)
       .property("target-bitrate", bitrate)
+      .property("temporal-scalability-number-layers", 3i32)
+      .property("temporal-scalability-periodicity", 4i32)
+      .property("temporal-scalability-layer-id", temporal_layer_ids)
+      .property("temporal-scalability-layer-sync-flags", temporal_layer_sync_flags)
+      .property("temporal-scalability-rate-decimator", temporal_rate_decimator)
+      .property("temporal-scalability-target-bitrate", temporal_target_bitrate)
       .build()
       .map_err(|err| anyhow!("failed to create vp8enc for {label}: {err}"))?;
   

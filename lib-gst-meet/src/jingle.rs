@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt, net::SocketAddr};
+use std::{collections::HashMap, fmt, net::SocketAddr, sync::{Arc}};
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures::stream::StreamExt as _;
@@ -26,7 +26,7 @@ use jitsi_xmpp_parsers::{
 use nice_gst_meet as nice;
 use rand::random;
 use sha2::{Digest as _, Sha256};
-use tokio::{net::lookup_host, runtime::Handle, sync::oneshot, task::JoinHandle};
+use tokio::{net::lookup_host, runtime::Handle, sync::{Mutex, oneshot}, task::JoinHandle};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use xmpp_parsers::{

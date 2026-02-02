@@ -213,6 +213,57 @@ impl JingleSession {
     Ok(self.pipeline_state_null_rx.await?)
   }
 
+  fn map_payload_to_caps(
+    codecs: &[Codec],
+    pt: u8,
+    audio_hdrext_ssrc_audio_level: Option<u16>,
+    audio_hdrext_transport_cc: Option<u16>,
+    video_hdrext_transport_cc: Option<u16>,
+  ) -> Result<Option<gstreamer::Caps>> {
+    let mut caps = gstreamer::Caps::builder("application/x-rtp").field("payload", pt as i32);
+    for codec in codecs.iter() {
+      if codec.is(pt) {
+        if codec.is_audio() {
+          caps = caps
+            .field("media", "audio")
+            .field("encoding-name", "OPUS")
+            .field("clock-rate", 48000);
+          if let Some(hdrext) = audio_hdrext_ssrc_audio_level {
+            caps = caps.field(&format!("extmap-{}", hdrext), RTP_HDREXT_SSRC_AUDIO_LEVEL);
+          }
+          if let Some(hdrext) = audio_hdrext_transport_cc {
+            caps = caps.field(&format!("extmap-{}", hdrext), RTP_HDREXT_TRANSPORT_CC);
+          }
+        }
+        else {
+          // A video codec, as the only audio codec we support is Opus.
+          caps = caps
+            .field("media", "video")
+            .field("clock-rate", 90000)
+            .field("encoding-name", codec.encoding_name())
+            .field("rtcp-fb-nack-pli", true);
+          //.field("extmap-sdes:rtp-stream-id", RTP_HDREXT_RTP_STREAM_ID)
+          //.field("extmap-sdes:mid", RTP_HDREXT_RTP_MEDIA_ID);
+          if let Some(hdrext) = video_hdrext_transport_cc {
+            caps = caps.field(&format!("extmap-{}", hdrext), RTP_HDREXT_TRANSPORT_CC);
+          }
+        }
+        return Ok(Some(caps.build()));
+      }
+      else if codec.is_rtx(pt) {
+        caps = caps
+          .field("media", "video")
+          .field("clock-rate", 90000)
+          .field("encoding-name", "RTX")
+          .field("apt", codec.pt);
+        return Ok(Some(caps.build()));
+      }
+    }
+
+    warn!("unknown payload type: {}", pt);
+    Ok(None)
+  }
+
   fn parse_rtp_description(
     description: &RtpDescription,
     remote_ssrc_map: &mut HashMap<u32, Source>,
@@ -624,53 +675,21 @@ impl JingleSession {
     {
       let codecs = codecs.clone();
       rtpbin.connect("request-pt-map", false, move |values| {
-        let f = || {
-          debug!("rtpbin  {:?}", values);
-          let pt = values[2].get::<u32>()? as u8;
-          let mut caps = gstreamer::Caps::builder("application/x-rtp").field("payload", pt as i32);
-          for codec in codecs.iter() {
-            if codec.is(pt) {
-              if codec.is_audio() {
-                caps = caps
-                  .field("media", "audio")
-                  .field("encoding-name", "OPUS")
-                  .field("clock-rate", 48000);
-                if let Some(hdrext) = audio_hdrext_ssrc_audio_level {
-                  caps = caps.field(&format!("extmap-{}", hdrext), RTP_HDREXT_SSRC_AUDIO_LEVEL);
-                }
-                if let Some(hdrext) = audio_hdrext_transport_cc {
-                  caps = caps.field(&format!("extmap-{}", hdrext), RTP_HDREXT_TRANSPORT_CC);
-                }
-              }
-              else {
-                // A video codec, as the only audio codec we support is Opus.
-                caps = caps
-                  .field("media", "video")
-                  .field("clock-rate", 90000)
-                  .field("encoding-name", codec.encoding_name())
-                  .field("rtcp-fb-nack-pli", true);
-                  //.field("extmap-sdes:rtp-stream-id", RTP_HDREXT_RTP_STREAM_ID)
-                  //.field("extmap-sdes:mid", RTP_HDREXT_RTP_MEDIA_ID);
-                if let Some(hdrext) = video_hdrext_transport_cc {
-                  caps = caps.field(&format!("extmap-{}", hdrext), RTP_HDREXT_TRANSPORT_CC);
-                }
-              }
-              return Ok::<_, anyhow::Error>(Some(caps.build()));
-            }
-            else if codec.is_rtx(pt) {
-              caps = caps
-                .field("media", "video")
-                .field("clock-rate", 90000)
-                .field("encoding-name", "RTX")
-                .field("apt", codec.pt);
-              return Ok(Some(caps.build()));
-            }
+        debug!("rtpbin  {:?}", values);
+        let pt = match values[2].get::<u32>() {
+          Ok(pt) => pt as u8,
+          Err(e) => {
+            error!("handling request-pt-map: {:?}", e);
+            return None;
           }
-
-          warn!("unknown payload type: {}", pt);
-          Ok(None)
         };
-        match f() {
+        match JingleSession::map_payload_to_caps(
+          &codecs,
+          pt,
+          audio_hdrext_ssrc_audio_level,
+          audio_hdrext_transport_cc,
+          video_hdrext_transport_cc,
+        ) {
           Ok(Some(caps)) => {
             debug!("mapped pt to caps: {:?}", caps);
             Some(caps.to_value())

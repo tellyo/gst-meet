@@ -264,6 +264,44 @@ impl JingleSession {
     Ok(None)
   }
 
+  fn handle_new_jitterbuffer(
+    values: &[glib::Value],
+    handle: &Handle,
+    jingle_session: &Arc<Mutex<Option<JingleSession>>>,
+    buffer_size: u32,
+  ) -> Result<()> {
+    let rtpjitterbuffer: gstreamer::Element = values[1].get()?;
+    let session: u32 = values[2].get()?;
+    let ssrc: u32 = values[3].get()?;
+    debug!(
+      "new jitterbuffer created for session {} ssrc {}",
+      session, ssrc
+    );
+
+    let jingle_session = jingle_session.clone();
+    let source = handle.block_on(async move {
+      Ok::<_, anyhow::Error>(
+        jingle_session
+          .lock()
+          .await
+          .as_ref()
+          .context("not connected (no jingle session)")?
+          .remote_ssrc_map
+          .get(&ssrc)
+          .context(format!("unknown ssrc: {}", ssrc))?
+          .clone(),
+      )
+    })?;
+    debug!("jitterbuffer is for remote source: {:?}", source);
+    if source.media_type == MediaType::Video && source.participant_id.is_some() {
+      debug!("enabling RTX for ssrc {}", ssrc);
+      rtpjitterbuffer.set_property("do-retransmission", true);
+      rtpjitterbuffer.set_property("drop-on-latency", true);
+      rtpjitterbuffer.set_property("latency", buffer_size);
+    }
+    Ok(())
+  }
+
   fn parse_rtp_description(
     description: &RtpDescription,
     remote_ssrc_map: &mut HashMap<u32, Source>,
@@ -709,38 +747,9 @@ impl JingleSession {
     rtpbin.connect("new-jitterbuffer", false, move |values| {
       let handle = handle.clone();
       let jingle_session = jingle_session.clone();
-      let f = move || {
-        let rtpjitterbuffer: gstreamer::Element = values[1].get()?;
-        let session: u32 = values[2].get()?;
-        let ssrc: u32 = values[3].get()?;
-        debug!(
-          "new jitterbuffer created for session {} ssrc {}",
-          session, ssrc
-        );
-
-        let source = handle.block_on(async move {
-          Ok::<_, anyhow::Error>(
-            jingle_session
-              .lock()
-              .await
-              .as_ref()
-              .context("not connected (no jingle session)")?
-              .remote_ssrc_map
-              .get(&ssrc)
-              .context(format!("unknown ssrc: {}", ssrc))?
-              .clone(),
-          )
-        })?;
-        debug!("jitterbuffer is for remote source: {:?}", source);
-        if source.media_type == MediaType::Video && source.participant_id.is_some() {
-          debug!("enabling RTX for ssrc {}", ssrc);
-          rtpjitterbuffer.set_property("do-retransmission", true);
-          rtpjitterbuffer.set_property("drop-on-latency", true);
-          rtpjitterbuffer.set_property("latency", buffer_size);
-        }
-        Ok::<_, anyhow::Error>(())
-      };
-      if let Err(e) = f() {
+      if let Err(e) =
+        JingleSession::handle_new_jitterbuffer(values, &handle, &jingle_session, buffer_size)
+      {
         warn!("new-jitterbuffer: {:?}", e);
       }
       None

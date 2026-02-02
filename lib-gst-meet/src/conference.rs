@@ -100,6 +100,8 @@ pub struct JitsiConferenceConfig {
 
   pub buffer_size: u32,
 
+  pub number_of_layers: u32,
+
   #[cfg(feature = "log-rtp")]
   pub log_rtp: bool,
   #[cfg(feature = "log-rtp")]

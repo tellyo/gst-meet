@@ -124,6 +124,13 @@ struct Opt {
   )]
   conference_url: String,
 
+  #[structopt(
+    long,
+    env = "NUMER_OF_LAYERS",
+    help = "Number of layers to use for the video"
+  )]
+  number_of_layers: Option<u32>,
+
   #[structopt(long)]
   stereo: Option<bool>,
 }
@@ -170,6 +177,7 @@ struct GuestReturn {
   buffer_size: u32,
   websocket_uri: Uri,
   stereo: Option<bool>,
+  number_of_layers: u32,
 }
 
 #[derive(Serialize, Deserialize,Debug,Clone)]
@@ -226,6 +234,7 @@ async fn main_inner() -> Result<()> {
       buffer_size: opt.buffer_size,
       websocket_uri: Uri::default(),
       stereo: opt.stereo,
+      number_of_layers: opt.number_of_layers.unwrap_or(1),
     };
     
     let conference_domain = match opt.conference_url.clone().parse::<Uri>()?.into_parts().authority {
@@ -397,6 +406,7 @@ async fn start_guest(config: GuestReturn) -> Result<()> {
     recv_video_scale_height: recv_video_scale_height,
     recv_video_scale_width: recv_video_scale_width,
     buffer_size: config.buffer_size,
+    number_of_layers: config.number_of_layers,
    };
 
   let main_loop = glib::MainLoop::new(None, false);

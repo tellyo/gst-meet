@@ -305,12 +305,8 @@ impl JingleSession {
   fn build_aux_sender_bin(
     values: &[glib::Value],
     pts: &[(String, u32)],
-    video_ssrc0: u32,
-    video_ssrc1: u32,
-    video_ssrc2: u32,
-    video_rtx_ssrc0: u32,
-    video_rtx_ssrc1: u32,
-    video_rtx_ssrc2: u32,
+    video_ssrcs: &[u32],
+    video_rtx_ssrcs: &[u32],
   ) -> Result<glib::Value> {
     let session: u32 = values[1].get()?;
     debug!("creating RTX sender for session {}", session);
@@ -319,10 +315,10 @@ impl JingleSession {
     for (pt, rtx_pt) in pts.iter() {
       pt_map = pt_map.field(pt, rtx_pt);
     }
-    ssrc_map = ssrc_map
-      .field(&video_ssrc0.to_string(), &(video_rtx_ssrc0 as u32))
-      .field(&(video_ssrc1).to_string(), &(video_rtx_ssrc1 as u32))
-      .field(&(video_ssrc2).to_string(), &(video_rtx_ssrc2 as u32));
+
+    for (ssrc, rtx_ssrc) in video_ssrcs.iter().zip(video_rtx_ssrcs.iter()) {
+      ssrc_map = ssrc_map.field(&ssrc.to_string(), *rtx_ssrc as u32);
+    }
     let bin = gstreamer::Bin::new();
     let rtx_sender = gstreamer::ElementFactory::make("rtprtxsend")
       .property("payload-type-map", pt_map.build())
@@ -693,17 +689,21 @@ impl JingleSession {
     debug!("Local DTLS certificate:\n{}", dtls_cert_pem);
     debug!("Local DTLS fingerprint: {}", fingerprint_str);
 
+    let video_ssrcs = (0..conference.config.number_of_layers).map(|_| random()).collect::<Vec<u32>>();
+    let video_rtx_ssrcs = (0..conference.config.number_of_layers).map(|_| random()).collect::<Vec<u32>>();
     let audio_ssrc: u32 = random();
-    let video_ssrc0: u32 = random();
-    let video_ssrc1: u32 = video_ssrc0 + 1;
-    let video_ssrc2: u32 = video_ssrc0 + 2;
-    let video_rtx_ssrc0: u32 = random();
-    let video_rtx_ssrc1: u32 = video_rtx_ssrc0 + 1;
-    let video_rtx_ssrc2: u32 = video_rtx_ssrc0 + 2;
+
+    // let audio_ssrc: u32 = random();
+    // let video_ssrc0: u32 = random();
+    // let video_ssrc1: u32 = video_ssrc0 + 1;
+    // let video_ssrc2: u32 = video_ssrc0 + 2;
+    // let video_rtx_ssrc0: u32 = random();
+    // let video_rtx_ssrc1: u32 = video_rtx_ssrc0 + 1;
+    // let video_rtx_ssrc2: u32 = video_rtx_ssrc0 + 2;
 
     debug!("audio SSRC: {}", audio_ssrc);
-    debug!("video SSRC: {}", video_ssrc0);
-    debug!("video RTX SSRC: {}", video_rtx_ssrc0);
+    debug!("video SSRC: {:?}", video_ssrcs);
+    debug!("video RTX SSRC: {:?}", video_rtx_ssrcs);
 
     let (ice_agent, ice_stream_id, ice_component_id) =
       JingleSession::setup_ice(conference, ice_transport).await?;
@@ -816,16 +816,14 @@ impl JingleSession {
       let pts = pts.clone();
       info!("codecs: {:?}", codecs.clone());
       info!("pts: {:?}", pts.clone());
+      let video_ssrcs = video_ssrcs.clone();
+      let video_rtx_ssrcs = video_rtx_ssrcs.clone();
       rtpbin.connect("request-aux-sender", false, move |values| {
         match JingleSession::build_aux_sender_bin(
           values,
           &pts,
-          video_ssrc0,
-          video_ssrc1,
-          video_ssrc2,
-          video_rtx_ssrc0,
-          video_rtx_ssrc1,
-          video_rtx_ssrc2,
+          &video_ssrcs,
+          &video_rtx_ssrcs,
         ) {
           Ok(value) => Some(value),
           Err(e) => {
@@ -1231,13 +1229,13 @@ impl JingleSession {
 
     // create three video sinks
     let mut video_sink_elements = vec![];
-    for i in 0..3 {
+    for i in 0..conference.config.number_of_layers {
       let rtpfunnel = gstreamer::ElementFactory::make("rtpfunnel").build()?;
       pipeline.add(&rtpfunnel)?;
 
       let video_sink_element = JingleSession::create_video_sink_element(
         conference.config.video_codec.as_str(),
-        &codecs, video_ssrc0+i as u32)?;
+        &codecs, video_ssrcs[i as usize])?;
       pipeline.add(&video_sink_element)?;
       debug!("linking video payloader -> rtpfunnel");
       video_sink_element.link(&rtpfunnel)?;
@@ -1261,16 +1259,23 @@ impl JingleSession {
 
     let rtp_recv_identity = gstreamer::ElementFactory::make("identity").build()?;
     pipeline.add(&rtp_recv_identity)?;
-    let rtcp_recv_identity = gstreamer::ElementFactory::make("identity").build()?;
-    pipeline.add(&rtcp_recv_identity)?;
-    let rtp_send_identity0 = gstreamer::ElementFactory::make("identity").build()?;
-    pipeline.add(&rtp_send_identity0)?;
-    let rtp_send_identity1 = gstreamer::ElementFactory::make("identity").build()?;
-    pipeline.add(&rtp_send_identity1)?;
-    let rtp_send_identity2 = gstreamer::ElementFactory::make("identity").build()?;
-    pipeline.add(&rtp_send_identity2)?;
+
+    let mut rtp_send_identity = vec![];
+    for i in 0..conference.config.number_of_layers {
+      rtp_send_identity[i as usize] = gstreamer::ElementFactory::make("identity").build()?;
+      pipeline.add(&rtp_send_identity[i as usize])?;
+    }
+    // let rtp_send_identity0 = gstreamer::ElementFactory::make("identity").build()?;
+    // pipeline.add(&rtp_send_identity0)?;
+    // let rtp_send_identity1 = gstreamer::ElementFactory::make("identity").build()?;
+    // pipeline.add(&rtp_send_identity1)?;
+    // let rtp_send_identity2 = gstreamer::ElementFactory::make("identity").build()?;
+    // pipeline.add(&rtp_send_identity2)?;
+
     let rtcp_send_identity = gstreamer::ElementFactory::make("identity").build()?;
     pipeline.add(&rtcp_send_identity)?;
+    let rtcp_recv_identity = gstreamer::ElementFactory::make("identity").build()?;
+    pipeline.add(&rtcp_recv_identity)?;
 
     #[cfg(feature = "log-rtp")]
     {
@@ -1340,14 +1345,18 @@ impl JingleSession {
     rtcp_recv_identity.link_pads(None, &rtpbin, Some("recv_rtcp_sink_0"))?;
 
     debug!("linking rtpbin -> dtlssrtpenc");
-    rtpbin.link_pads(Some("send_rtp_src_0"), &rtp_send_identity0, None)?;
-    rtp_send_identity0.link_pads(None, &dtlssrtpenc, Some("rtp_sink_0"))?;
+    for i in 0..conference.config.number_of_layers {
+      rtpbin.link_pads(Some(&format!("send_rtp_src_{}", i)), &rtp_send_identity[i as usize], None)?;
+      rtp_send_identity[i as usize].link_pads(None, &dtlssrtpenc, Some(&format!("rtp_sink_{}", i)))?;
+    }
+    // rtpbin.link_pads(Some("send_rtp_src_0"), &rtp_send_identity0, None)?;
+    // rtp_send_identity0.link_pads(None, &dtlssrtpenc, Some("rtp_sink_0"))?;
 
-    rtpbin.link_pads(Some("send_rtp_src_1"), &rtp_send_identity1, None)?;
-    rtp_send_identity1.link_pads(None, &dtlssrtpenc, Some("rtp_sink_1"))?;
+    // rtpbin.link_pads(Some("send_rtp_src_1"), &rtp_send_identity1, None)?;
+    // rtp_send_identity1.link_pads(None, &dtlssrtpenc, Some("rtp_sink_1"))?;
     
-    rtpbin.link_pads(Some("send_rtp_src_2"), &rtp_send_identity2, None)?;
-    rtp_send_identity2.link_pads(None, &dtlssrtpenc, Some("rtp_sink_2"))?;
+    // rtpbin.link_pads(Some("send_rtp_src_2"), &rtp_send_identity2, None)?;
+    // rtp_send_identity2.link_pads(None, &dtlssrtpenc, Some("rtp_sink_2"))?;
 
 
 
@@ -1459,7 +1468,7 @@ impl JingleSession {
         audio_ssrc.to_string()
       }
       else {
-        video_ssrc0.to_string()
+        video_ssrcs[0].to_string()
       });
 
       description.ssrcs = if initiate_content.name.0 == "audio" {
@@ -1471,14 +1480,14 @@ impl JingleSession {
       }
       else {
         let source_name = format!("{endpoint_id}-v0");
-        vec![
-          jingle_ssma::Source::new(video_ssrc0, Some(source_name.clone()), Some("camera".into())),
-          jingle_ssma::Source::new(video_rtx_ssrc0, Some(source_name.clone()), Some("camera".into())),
-          jingle_ssma::Source::new(video_ssrc1, Some(source_name.clone()), Some("camera".into())),
-          jingle_ssma::Source::new(video_rtx_ssrc1, Some(source_name.clone()), Some("camera".into())),
-          jingle_ssma::Source::new(video_ssrc2, Some(source_name.clone()), Some("camera".into())),
-          jingle_ssma::Source::new(video_rtx_ssrc2, Some(source_name.clone()), Some("camera".into())),
-        ]
+        let mut sources = vec![];
+
+        for i in 0..conference.config.number_of_layers {
+          sources.push(jingle_ssma::Source::new(video_ssrcs[i as usize], Some(source_name.clone()), Some("camera".into())));
+          sources.push(jingle_ssma::Source::new(video_rtx_ssrcs[i as usize], Some(source_name.clone()), Some("camera".into())));
+        };
+
+        sources
       };
 
       for ssrc in description.ssrcs.iter_mut() {
@@ -1492,38 +1501,60 @@ impl JingleSession {
         vec![]
       }
       else {
-        vec![
-          jingle_ssma::Group {
-          semantics: Semantics::Fid,
-          sources: vec![
-            jingle_ssma::Source::new(video_ssrc0, None, None),
-            jingle_ssma::Source::new(video_rtx_ssrc0, None, None),
-          ],
-        },
-          jingle_ssma::Group {
-          semantics: Semantics::Fid,
-          sources: vec![
-            jingle_ssma::Source::new(video_ssrc1, None, None),
-            jingle_ssma::Source::new(video_rtx_ssrc1, None, None),
-          ],
-        },
-          jingle_ssma::Group {
-          semantics: Semantics::Fid,
-          sources: vec![
-            jingle_ssma::Source::new(video_ssrc2, None, None),
-            jingle_ssma::Source::new(video_rtx_ssrc2, None, None),
-          ],
-        },
-        jingle_ssma::Group {
+        let mut groups = vec![];
+        for i in 0..conference.config.number_of_layers {
+          groups.push(jingle_ssma::Group {
+            semantics: Semantics::Fid,
+            sources: vec![
+              jingle_ssma::Source::new(video_ssrcs[i as usize], None, None),
+              jingle_ssma::Source::new(video_rtx_ssrcs[i as usize], None, None),
+            ],
+          });
+        };
+
+        let mut sim_sources = vec![];
+        for i in 0..conference.config.number_of_layers {
+          sim_sources.push(jingle_ssma::Source::new(video_ssrcs[i as usize], None, None));
+        };
+
+        groups.push(jingle_ssma::Group {
           semantics: Semantics::Sim,
-          sources: vec![
-            jingle_ssma::Source::new(video_ssrc0, None, None),
-            jingle_ssma::Source::new(video_ssrc1, None, None),
-            jingle_ssma::Source::new(video_ssrc2, None, None),
-            //jingle_ssma::Source::new(video_rtx_ssrc, None, None),
-          ],
-        },
-        ]
+          sources: sim_sources,
+        });
+
+        groups
+
+        // vec![
+        //   jingle_ssma::Group {
+        //   semantics: Semantics::Fid,
+        //   sources: vec![
+        //     jingle_ssma::Source::new(video_ssrcs[0], None, None),
+        //     jingle_ssma::Source::new(video_rtx_ssrcs[0], None, None),
+        //   ],
+        // },
+        //   jingle_ssma::Group {
+        //   semantics: Semantics::Fid,
+        //   sources: vec![
+        //     jingle_ssma::Source::new(video_ssrcs[1], None, None),
+        //     jingle_ssma::Source::new(video_rtx_ssrcs[1], None, None),
+        //   ],
+        // },
+        //   jingle_ssma::Group {
+        //   semantics: Semantics::Fid,
+        //   sources: vec![
+        //     jingle_ssma::Source::new(video_ssrcs[2], None, None),
+        //     jingle_ssma::Source::new(video_rtx_ssrcs[2], None, None),
+        //   ],
+        // },
+        // jingle_ssma::Group {
+        //   semantics: Semantics::Sim,
+        //   sources: vec![
+        //     jingle_ssma::Source::new(video_ssrcs[0], None, None),
+        //     jingle_ssma::Source::new(video_ssrcs[1], None, None),
+        //     jingle_ssma::Source::new(video_ssrcs[2], None, None),
+        //   ],
+        // },
+        // ]
       };
 
 

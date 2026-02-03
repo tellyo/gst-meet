@@ -779,6 +779,18 @@ fn create_simulcast_from_rtmp() -> Result<gstreamer::Bin> {
   let queue1 = gstreamer::ElementFactory::make("queue")
       .build()
       .map_err(|err| anyhow!("failed to create queue: {err}"))?;
+  
+  let src_caps = gstreamer::Caps::builder("video/x-h264")
+      .field("width", 1280i32)
+      .field("height", 720i32)
+      .field("framerate", gstreamer::Fraction::new(25, 1))
+      .build();
+
+  let src_capsfilter = gstreamer::ElementFactory::make("capsfilter")
+      .name("src_caps")
+      .property("caps", &src_caps)
+      .build()
+      .map_err(|err| anyhow!("failed to create src capsfilter: {err}"))?;
 
   let h264parse = gstreamer::ElementFactory::make("h264parse")
     .property("config-interval", -1i32)
@@ -795,7 +807,7 @@ fn create_simulcast_from_rtmp() -> Result<gstreamer::Bin> {
       .map_err(|err| anyhow!("failed to create tee: {err}"))?;
 
   bin
-      .add_many([&src, &flvdemux, &queue1, &h264parse, &openh264dec, &tee])
+      .add_many([&src, &src_capsfilter, &flvdemux, &queue1, &h264parse, &openh264dec, &tee])
       .map_err(|err| anyhow!("failed to add base elements: {err}"))?;
 
   src.link(&flvdemux)
@@ -805,19 +817,35 @@ fn create_simulcast_from_rtmp() -> Result<gstreamer::Bin> {
       .static_pad("sink")
       .context("queue1 sink pad missing")?;
 
-  flvdemux.connect_pad_added(move |flvdemux, pad| {
+  flvdemux.connect_pad_added(move |_flvdemux, pad| {
     info!("Pad added: {:?}", pad);
-    //let pad_name: String = pad.property("name");
-    let pad_name  = pad.name();
-    if pad_name.starts_with("video") {
-      pad
-        .link(&queue1_sink)
-        .map_err(|err| anyhow!("failed to link flvdemux to queue1: {err}"))
-        .unwrap();
-      }
+    let pad_name = pad.name();
+    if !pad_name.starts_with("video") {
+      return;
+    }
+
+    if queue1_sink.is_linked() {
+      warn!("queue1 sink already linked; ignoring pad {}", pad_name);
+      return;
+    }
+
+    let caps = pad.current_caps().unwrap_or_else(|| pad.query_caps(None));
+    let is_h264 = caps
+      .structure(0)
+      .map(|structure| structure.name() == "video/x-h264")
+      .unwrap_or(false);
+
+    if !is_h264 {
+      warn!("Ignoring non-h264 pad {} with caps {:?}", pad_name, caps);
+      return;
+    }
+
+    if let Err(err) = pad.link(&queue1_sink) {
+      warn!("failed to link flvdemux to queue1: {err}");
+    }
   });
 
-  gstreamer::Element::link_many([&queue1, &h264parse, &openh264dec, &tee])
+  gstreamer::Element::link_many([&queue1, &src_capsfilter, &h264parse, &openh264dec, &tee])
       .map_err(|err| anyhow!("failed to link source chain: {err}"))?;
 
   // Build three simulcast branches (1080p, 720p, 360p).
@@ -851,7 +879,7 @@ fn create_simulcast_bin() -> Result<gstreamer::Bin> {
   let src_caps = gstreamer::Caps::builder("video/x-raw")
       .field("width", 1280i32)
       .field("height", 720i32)
-      .field("framerate", gstreamer::Fraction::new(30, 1))
+      .field("framerate", gstreamer::Fraction::new(25, 1))
       .build();
 
   let src_capsfilter = gstreamer::ElementFactory::make("capsfilter")
@@ -950,7 +978,7 @@ fn add_simulcast_branch(
       let caps = gstreamer::Caps::builder("video/x-raw")
           .field("width", width)
           .field("height", height)
-          .field("framerate", gstreamer::Fraction::new(30, 1))
+          .field("framerate", gstreamer::Fraction::new(25, 1))
           .build();
       let capsfilter = gstreamer::ElementFactory::make("capsfilter")
           .name(&format!("caps_{}", label))

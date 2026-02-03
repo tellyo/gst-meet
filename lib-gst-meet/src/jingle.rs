@@ -1260,9 +1260,10 @@ impl JingleSession {
     let rtp_recv_identity = gstreamer::ElementFactory::make("identity").build()?;
     pipeline.add(&rtp_recv_identity)?;
 
-    let mut rtp_send_identity = vec![];
+
+    let mut rtp_send_identity = vec![]; 
     for i in 0..conference.config.number_of_layers {
-      rtp_send_identity[i as usize] = gstreamer::ElementFactory::make("identity").build()?;
+      rtp_send_identity.push(gstreamer::ElementFactory::make("identity").build()?);
       pipeline.add(&rtp_send_identity[i as usize])?;
     }
     // let rtp_send_identity0 = gstreamer::ElementFactory::make("identity").build()?;

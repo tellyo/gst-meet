@@ -12,7 +12,7 @@ use glib::{
 use gstreamer::{
   GhostPad,
   ffi,
-  prelude::{ElementExt as _, ElementExtManual, GstBinExt as _, GstBinExtManual, PadExt},
+  prelude::{ElementExt as _, ElementExtManual, GstBinExt as _, GstBinExtManual, GstObjectExt, PadExt},
 };
 use http::Uri;
 use lib_gst_meet::{
@@ -251,7 +251,8 @@ async fn main_inner() -> Result<()> {
     .transpose()
     .context("failed to parse recv pipeline")?;
 
-  let send_bin = Some(create_simulcast_bin()?);
+  //let send_bin = Some(create_simulcast_bin()?);
+  let send_bin = Some(create_simulcast_from_rtmp()?);
 
   let mut web_socket_url: Uri = opt.web_socket_url.parse()?;
   let mut web_socket_url_parts = web_socket_url.into_parts();
@@ -357,6 +358,7 @@ async fn main_inner() -> Result<()> {
     recv_video_scale_height,
     recv_video_scale_width,
     buffer_size,
+    number_of_layers: 3,
     #[cfg(feature = "log-rtp")]
     log_rtp,
     #[cfg(feature = "log-rtp")]
@@ -751,6 +753,87 @@ async fn main_inner() -> Result<()> {
   Ok(())
 }
 
+fn create_simulcast_from_rtmp() -> Result<gstreamer::Bin> {
+  // rtmpsrc location="rtmp://test-streamer-s3dev.aws-dev.intranet/stream_test/singer" ! \
+  // flvdemux name=d \
+  // d.video ! \
+  // queue ! \
+  // h264parse config-interval=-1 ! \
+  // openh264dec ! \\
+
+  let bin = gstreamer::Bin::new();
+
+  info!("Starting simulcast sender");
+
+  let src = gstreamer::ElementFactory::make("rtmpsrc")
+      .name("src")
+      .property("location", "rtmp://test-streamer-s3dev.aws-dev.intranet/stream_test/singer")
+      .build()
+      .map_err(|err| anyhow!("failed to create rtmpsrc: {err}"))?;
+
+  let flvdemux = gstreamer::ElementFactory::make("flvdemux")
+    .name("flvdemux")
+    .build()
+    .map_err(|err| anyhow!("failed to create flvdemux: {err}"))?;
+
+  let queue1 = gstreamer::ElementFactory::make("queue")
+      .build()
+      .map_err(|err| anyhow!("failed to create queue: {err}"))?;
+
+  let h264parse = gstreamer::ElementFactory::make("h264parse")
+    .property("config-interval", -1i32)
+    .build()
+    .map_err(|err| anyhow!("failed to create h264parse: {err}"))?;
+
+  let openh264dec = gstreamer::ElementFactory::make("openh264dec")
+    .build()
+    .map_err(|err| anyhow!("failed to create openh264dec: {err}"))?;
+
+  let tee = gstreamer::ElementFactory::make("tee")
+      .name("tee")
+      .build()
+      .map_err(|err| anyhow!("failed to create tee: {err}"))?;
+
+  bin
+      .add_many([&src, &flvdemux, &queue1, &h264parse, &openh264dec, &tee])
+      .map_err(|err| anyhow!("failed to add base elements: {err}"))?;
+
+  src.link(&flvdemux)
+    .map_err(|err| anyhow!("failed to link src to flvdemux: {err}"))?;
+  
+  let queue1_sink = queue1
+      .static_pad("sink")
+      .context("queue1 sink pad missing")?;
+
+  flvdemux.connect_pad_added(move |flvdemux, pad| {
+    info!("Pad added: {:?}", pad);
+    //let pad_name: String = pad.property("name");
+    let pad_name  = pad.name();
+    if pad_name.starts_with("video") {
+      pad
+        .link(&queue1_sink)
+        .map_err(|err| anyhow!("failed to link flvdemux to queue1: {err}"))
+        .unwrap();
+      }
+  });
+
+  gstreamer::Element::link_many([&queue1, &h264parse, &openh264dec, &tee])
+      .map_err(|err| anyhow!("failed to link source chain: {err}"))?;
+
+  // Build three simulcast branches (1080p, 720p, 360p).
+  add_simulcast_branch(
+      &bin, &tee, "low", 320, 180, 100, 2, true, 750,
+  )?;
+  add_simulcast_branch(
+      &bin, &tee, "medium", 640, 360, 100, 1, true, 1500,
+  )?;
+  add_simulcast_branch(
+      &bin, &tee, "high", 1280, 720, 100, 0, false, 3000,
+  )?;
+
+  Ok(bin)
+}
+
 
 fn create_simulcast_bin() -> Result<gstreamer::Bin> {
   let bin = gstreamer::Bin::new();
@@ -879,12 +962,6 @@ fn add_simulcast_branch(
   }
 
   info!("Creating vp8enc for {label}");
-  // temporal-scalability-number-layers=3
-  // temporal-scalability-periodicity=4
-  // temporal-scalability-layer-id="1,2,3"
-  // temporal-scalability-layer-sync-flags="false,false,false,true"
-  // temporal-scalability-rate-decimator="1,2,4"
-  // temporal-scalability-target-bitrate="500000,1000000,1500000"
 
   // must be GValueArray
   let mut temporal_layer_ids = glib::ValueArray::new(3);

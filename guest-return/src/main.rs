@@ -461,6 +461,29 @@ async fn start_guest(config: GuestReturn) -> Result<()> {
         else {
             conference.set_muted(MediaType::Video, true).await?;
         }
+        let video_sinks = conference.video_sink_elements().await?;
+        // add all those three queues to the bin
+        // @TODO: NOT YET
+        // for i in 0..config.number_of_layers {
+        //   if let Some(queue) = bin.by_name(&format!("video{}", i)) {
+        //     info!("Found video {}p element in pipeline, linking...", i);
+        //     queue.link(&video_sinks.get(i).unwrap())?;
+        //   }
+        // }
+        if let Some(queue) = bin.by_name("video0") {
+          info!("Found video 180p element in pipeline, linking...");
+          queue.link(&video_sinks[0])?;
+        }
+
+        if let Some(queue) = bin.by_name("video1") {
+          info!("Found video 360p element in pipeline, linking...");
+          queue.link(&video_sinks[1])?;
+        }
+
+        if let Some(queue) = bin.by_name("video2") {
+          info!("Found video 720p element in pipeline, linking...");
+          queue.link(&video_sinks[2])?;
+        }
 
         let pipeline = conference.pipeline().await?;
         let pli_injector = pipeline.by_name("pli-injector").unwrap();
@@ -519,15 +542,15 @@ async fn start_guest(config: GuestReturn) -> Result<()> {
           }
         };
     
-        pipeline
-          .by_name("rtcp_logger_sender")
-          .unwrap()
-          .connect("handoff", false, make_rtcp_logger("SEND"));
+        // pipeline
+        //   .by_name("rtcp_logger_sender")
+        //   .unwrap()
+        //   .connect("handoff", false, make_rtcp_logger("SEND"));
     
-        pipeline
-          .by_name("rtcp_logger_receiver")
-          .unwrap()
-          .connect("handoff", false, make_rtcp_logger("RECV"));
+        // pipeline
+        //   .by_name("rtcp_logger_receiver")
+        //   .unwrap()
+        //   .connect("handoff", false, make_rtcp_logger("RECV"));
     }
     else {
         conference.set_muted(MediaType::Audio, true).await?;
@@ -662,9 +685,26 @@ fn generate_gst_pipeline_string(codec: String, ip_video: String, port_video: Str
     }
 
     "vp8" => {
+  format!("rtpbin name=return_rtpbin rtp-profile=avpf
+	udpsrc
+      reuse=true
+      address={ip_video}
+      port={port_video}
+      caps=\"application/x-rtp, media=video, clock-rate=90000, encoding-name=VP8, rtcp-fb-nack=1, rtcp-fb-nack-pli=(int)1, rtcp-fb-ccm-fir=1, payload=96\"
+    ! return_rtpbin.recv_rtp_sink_0
+    return_rtpbin. ! identity name=pli-injector ! rtpvp8depay ! queue name=video0
+    return_rtpbin. ! identity name=pli-injector1 ! rtpvp8depay ! queue name=video1
+    return_rtpbin. ! identity name=pli-injector2 ! rtpvp8depay ! queue name=video2
+    udpsrc reuse=true address={ip_video} port=5035 ! identity name=rtcp_logger_receiver ! return_rtpbin.recv_rtcp_sink_0
+    ")
+    }
+
+    "vp8-old" => {
   format!("rtpbin name=return_rtpbin
     udpsrc reuse=true address={ip_video} port={port_video} caps=\"application/x-rtp, media=video, clock-rate=90000, encoding-name=VP8, rtcp-fb-nack=1, rtcp-fb-nack-pli=(int)1, rtcp-fb-ccm-fir=1, payload=96\" ! return_rtpbin.recv_rtp_sink_0
-    return_rtpbin. ! identity name=pli-injector ! rtpvp8depay ! queue name=video
+    return_rtpbin. ! identity name=pli-injector ! rtpvp8depay ! queue name=video0
+    return_rtpbin. ! identity name=pli-injector ! rtpvp8depay ! queue name=video1
+    return_rtpbin. ! identity name=pli-injector ! rtpvp8depay ! queue name=video2
     udpsrc reuse=true address={ip_video} port=5035 ! identity name=rtcp_logger_receiver ! return_rtpbin.recv_rtcp_sink_0
     return_rtpbin.send_rtcp_src_0 ! identity name=rtcp_logger_sender ! udpsink host=localhost port=5036 sync=false async=false
     jackaudiosrc connect=0 client-name={audio_source} !

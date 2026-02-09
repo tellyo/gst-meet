@@ -251,8 +251,8 @@ async fn main_inner() -> Result<()> {
     .transpose()
     .context("failed to parse recv pipeline")?;
 
-  //let send_bin = Some(create_simulcast_bin()?);
-  let send_bin = Some(create_simulcast_from_rtmp()?);
+  let send_bin = Some(create_simulcast_bin()?);
+  //let send_bin = Some(create_simulcast_from_rtmp()?);
 
   let mut web_socket_url: Uri = opt.web_socket_url.parse()?;
   let mut web_socket_url_parts = web_socket_url.into_parts();
@@ -935,7 +935,6 @@ fn create_simulcast_bin() -> Result<gstreamer::Bin> {
 
   Ok(bin)
 }
-
 fn gst_value_array(values: impl IntoIterator<Item = glib::Value>) -> glib::Value {
   let value_type = unsafe { from_glib(ffi::gst_value_array_get_type()) };
   let mut value = glib::Value::from_type(value_type);

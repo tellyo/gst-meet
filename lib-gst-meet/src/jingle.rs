@@ -693,14 +693,6 @@ impl JingleSession {
     let video_rtx_ssrcs = (0..conference.config.number_of_layers).map(|_| random()).collect::<Vec<u32>>();
     let audio_ssrc: u32 = random();
 
-    // let audio_ssrc: u32 = random();
-    // let video_ssrc0: u32 = random();
-    // let video_ssrc1: u32 = video_ssrc0 + 1;
-    // let video_ssrc2: u32 = video_ssrc0 + 2;
-    // let video_rtx_ssrc0: u32 = random();
-    // let video_rtx_ssrc1: u32 = video_rtx_ssrc0 + 1;
-    // let video_rtx_ssrc2: u32 = video_rtx_ssrc0 + 2;
-
     debug!("audio SSRC: {}", audio_ssrc);
     debug!("video SSRC: {:?}", video_ssrcs);
     debug!("video RTX SSRC: {:?}", video_rtx_ssrcs);
@@ -1227,7 +1219,7 @@ impl JingleSession {
     }
     pipeline.add(&audio_sink_element)?;
 
-    // create three video sinks
+    // create video sinks
     let mut video_sink_elements = vec![];
     for i in 0..conference.config.number_of_layers {
       let rtpfunnel = gstreamer::ElementFactory::make("rtpfunnel").build()?;

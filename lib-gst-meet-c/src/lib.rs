@@ -173,6 +173,7 @@ pub unsafe extern "C" fn gstmeet_connection_join_conference(
     log_rtp: false,
     #[cfg(feature = "log-rtp")]
     log_rtcp: false,
+    number_of_layers: 1,
   };
   (*context)
     .runtime

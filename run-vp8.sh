@@ -5,6 +5,7 @@ VP8_COMMON_ARGS="\
     deadline=2 \
     cpu-used=8 \
     end-usage=cbr \
+    keyframe-max-dist=30 \
     lag-in-frames=1 \
 "
 
@@ -29,16 +30,20 @@ BUF3="\
 TEMP_SCALABILITY_COMMON="\
     temporal-scalability-number-layers=3 \
     temporal-scalability-periodicity=4 \
-    temporal-scalability-layer-sync-flags='<false,false,false,true>' \
-    temporal-scalability-rate-decimator='{4,2,1}' \
+    temporal-scalability-layer-sync-flags=<false,false,false,true> \
+    temporal-scalability-rate-decimator={4,2,1} \
 "
 
 gst-launch-1.0 -v \
   rtpbin name=rtpbin latency=200 rtp-profile=avpf \
+  \
   funnel name=rtp_funnell \
-		! udpsink host=224.1.2.3 port=5322 \
+    ! application/x-rtp, media=video, encoding-name=VP8, payload=96, rtcp-fb-nack=1, rtcp-fb-nack-pli=1, rtcp-fb-ccm-fir=1 \
+		! udpsink host=239.4.3.2 port=5322 \
+  \
 	funnel name=rtcp_funnell \
-		! udpsink host=224.1.2.3 port=5323 sync=false async=false \
+		! udpsink host=239.4.3.2 port=5323 sync=false async=false \
+    \
   videotestsrc is-live=true pattern=smpte100 \
   ! video/x-raw,width=1280,height=720,framerate=30/1 \
   ! timecodestamper \
@@ -55,7 +60,7 @@ gst-launch-1.0 -v \
     $BUF1 \
     $TEMP_SCALABILITY_COMMON \
     temporal-scalability-layer-id='{1,2,3}' \
-    temporal-scalability-target-bitrate='{750,1500,3000}' \
+    temporal-scalability-target-bitrate='{500,1000,2000}' \
   ! queue \
   ! rtpvp8pay pt=96 ssrc=123450 picture-id-mode=2 \
   ! rtprtxqueue max-size-time=1000 max-size-packets=0 \
@@ -71,8 +76,8 @@ gst-launch-1.0 -v \
   $VP8_COMMON_ARGS \
     $BUF2 \
     $TEMP_SCALABILITY_COMMON \
-    temporal-scalability-layer-id='{4,5,6}' \
-    temporal-scalability-target-bitrate='{750,1500,3000}' \
+    temporal-scalability-layer-id='{1,2,3}' \
+    temporal-scalability-target-bitrate='{500,1000,2000}' \
   ! queue \
   ! rtpvp8pay pt=96 ssrc=123451 picture-id-mode=2 \
   ! rtprtxqueue max-size-time=1000 max-size-packets=0 \
@@ -86,13 +91,20 @@ gst-launch-1.0 -v \
   $VP8_COMMON_ARGS \
     $BUF3 \
     $TEMP_SCALABILITY_COMMON \
-    temporal-scalability-layer-id='{7,8,9}' \
+    temporal-scalability-layer-id='{1,2,3}' \
+    temporal-scalability-target-bitrate='{750,1500,3000}' \
   ! queue \
   ! rtpvp8pay pt=96 ssrc=123452 picture-id-mode=2 \
   ! rtprtxqueue max-size-time=1000 max-size-packets=0 \
   ! rtpbin.send_rtp_sink_2 \
   rtpbin.send_rtp_src_2 ! rtp_funnell.sink_2 \
-  rtpbin.send_rtcp_src_2 ! rtcp_funnell.sink_2
+  rtpbin.send_rtcp_src_2 ! rtcp_funnell.sink_2 \
+  udpsrc \
+    reuse=true \
+    name=udpsrc_rtcp \
+    address=localhost \
+    port=5324 \
+  ! rtpbin.recv_rtcp_sink_0
 
 
 exit $?

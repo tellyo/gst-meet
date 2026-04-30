@@ -39,7 +39,8 @@ use xmpp_parsers::{
 
 use crate::{
   colibri::ColibriChannel,
-  jingle::JingleSession,
+  jingle::{JingleSession, OutboundStatsSourceInfo},
+  rtc_stats::RtcOutboundRtpStreamStats,
   source::MediaType,
   stanza_filter::StanzaFilter,
   util::generate_id,
@@ -326,7 +327,16 @@ impl JitsiConference {
       .presence
       .retain(|el| el.name() != media_type.jitsi_muted_presence_element_name());
     locked_inner.presence.push(element);
-    self.send_presence(&locked_inner.presence).await
+    let result = self.send_presence(&locked_inner.presence).await;
+    drop(locked_inner);
+
+    if result.is_ok() {
+      if let Some(jingle_session) = self.jingle_session.lock().await.as_mut() {
+        jingle_session.set_outbound_stats_active(media_type, !muted);
+      }
+    }
+
+    result
   }
 
   pub async fn pipeline(&self) -> Result<gstreamer::Pipeline> {
@@ -399,6 +409,31 @@ impl JitsiConference {
     )
   }
 
+  pub async fn set_outbound_stats_source_element(
+    &self,
+    media_type: MediaType,
+    element: &gstreamer::Element,
+  ) -> Result<()> {
+    self
+      .jingle_session
+      .lock()
+      .await
+      .as_mut()
+      .context("not connected (no jingle session)")?
+      .set_outbound_stats_source_info(media_type, OutboundStatsSourceInfo::from_element(element));
+    Ok(())
+  }
+
+  pub async fn outbound_rtp_stats(&self) -> Result<Vec<RtcOutboundRtpStreamStats>> {
+    self
+      .jingle_session
+      .lock()
+      .await
+      .as_ref()
+      .context("not connected (no jingle session)")?
+      .outbound_rtp_stats()
+  }
+
   /// Set the max resolution that we are currently sending.
   ///
   /// Setting this is required for browser clients in the same conference to display
@@ -469,8 +504,7 @@ impl JitsiConference {
         drop(locked_inner);
         if let Err(e) = f(self.clone(), participant.clone()).await {
           warn!("on_participant failed: {:?}", e);
-        }
-        else if let Ok(pipeline) = self.pipeline().await {
+        } else if let Ok(pipeline) = self.pipeline().await {
           pipeline.debug_to_dot_file(
             gstreamer::DebugGraphDetails::ALL,
             &format!("participant-added-{}", participant.muc_jid.resource()),
@@ -500,8 +534,7 @@ impl JitsiConference {
       );
       if let Err(e) = f(self.clone(), participant.clone()).await {
         warn!("on_participant failed: {:?}", e);
-      }
-      else if let Ok(pipeline) = self.pipeline().await {
+      } else if let Ok(pipeline) = self.pipeline().await {
         pipeline.debug_to_dot_file(
           gstreamer::DebugGraphDetails::ALL,
           &format!("participant-added-{}", participant.muc_jid.resource()),
@@ -556,16 +589,14 @@ impl StanzaFilter for JitsiConference {
             if !ready {
               bail!("focus reports room not ready");
             }
-          }
-          else {
+          } else {
             bail!("focus IQ failed");
           };
 
           let mut locked_inner = self.inner.lock().await;
           self.send_presence(&locked_inner.presence).await?;
           locked_inner.state = JoiningMuc;
-        }
-        else {
+        } else {
           debug!("ignored non-IQ stanza while waiting for conference IQ");
         }
       },
@@ -581,16 +612,13 @@ impl StanzaFilter for JitsiConference {
             if muc_user.status.contains(&MucStatus::SelfPresence) {
               debug!("Joined MUC: {}", self.config.muc);
               self.inner.lock().await.state = Idle;
-            }
-            else {
+            } else {
               debug!("MUC user payload is not a self-presence");
             }
-          }
-          else {
+          } else {
             debug!("no MUC user payload in presence stanza");
           }
-        }
-        else {
+        } else {
           debug!("ignored non-presence stanza while waiting to join MUC");
         }
       },
@@ -630,8 +658,7 @@ impl StanzaFilter for JitsiConference {
                       self.xmpp_tx.send(iq.into()).await?;
                     },
                   }
-                }
-                else {
+                } else {
                   let iq = Iq::from_result(iq.id, Some(DISCO_INFO.clone()))
                     .with_from(Jid::Full(self.jid.clone()))
                     .with_to(iq.from.unwrap());
@@ -651,12 +678,10 @@ impl StanzaFilter for JitsiConference {
 
                       *self.jingle_session.lock().await =
                         Some(JingleSession::initiate(self, jingle).await?);
-                    }
-                    else {
+                    } else {
                       debug!("Ignored Jingle session-initiate from {}", from_jid);
                     }
-                  }
-                  else if jingle.action == Action::SourceAdd {
+                  } else if jingle.action == Action::SourceAdd {
                     debug!("Received Jingle source-add");
 
                     // Acknowledge the IQ
@@ -673,8 +698,7 @@ impl StanzaFilter for JitsiConference {
                       .source_add(jingle)
                       .await?;
                   }
-                }
-                else {
+                } else {
                   debug!("Received Jingle IQ from invalid JID: {:?}", iq.from);
                 }
               },
@@ -889,8 +913,7 @@ impl StanzaFilter for JitsiConference {
                               warn!("failed to send stats: {:?}", e);
                               std::process::exit(0);
                             }
-                          }
-                          else {
+                          } else {
                             warn!("unable to get stats from pipeline");
                           }
                           interval.tick().await;
@@ -957,8 +980,7 @@ impl StanzaFilter for JitsiConference {
             },
             _ => {},
           }
-        }
-        else if let Ok(presence) = Presence::try_from(element) {
+        } else if let Ok(presence) = Presence::try_from(element) {
           if let Jid::Full(from) = presence
             .from
             .as_ref()
@@ -1024,8 +1046,7 @@ impl StanzaFilter for JitsiConference {
                           warn!("on_participant_left failed: {:?}", e);
                         }
                       }
-                    }
-                    else if self
+                    } else if self
                       .inner
                       .lock()
                       .await
@@ -1038,8 +1059,7 @@ impl StanzaFilter for JitsiConference {
                         debug!("calling on_participant with new participant");
                         if let Err(e) = f(self.clone(), participant.clone()).await {
                           warn!("on_participant failed: {:?}", e);
-                        }
-                        else if let Some(jingle_session) =
+                        } else if let Some(jingle_session) =
                           self.jingle_session.lock().await.as_ref()
                         {
                           jingle_session.pipeline().debug_to_dot_file(

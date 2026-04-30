@@ -4,6 +4,7 @@ use anyhow::{bail, Context, Result};
 #[cfg(target_os = "macos")]
 use cocoa::appkit::NSApplication;
 use colibri::{ColibriMessage, Constraints, VideoType};
+use futures_util::{SinkExt, StreamExt};
 use glib::object::ObjectExt as _;
 use gstreamer::{
   prelude::{ElementExt as _, ElementExtManual as _, GstBinExt as _},
@@ -12,59 +13,65 @@ use gstreamer::{
 use http::Uri;
 use lib_gst_meet::{
   init_tracing, Authentication, Connection, JitsiConference, JitsiConferenceConfig, MediaType,
+  RtcOutboundRtpStreamStats,
 };
 use serde::Serialize;
 use structopt::StructOpt;
-use tokio::{signal::ctrl_c, task, time::{timeout, interval}, sync::mpsc};
+use tokio::{
+  signal::ctrl_c,
+  sync::mpsc,
+  task,
+  time::{interval, timeout},
+};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use futures_util::{SinkExt, StreamExt};
 use tracing::{error, info, trace, warn};
 
 #[derive(Debug, Serialize)]
 struct InitMessage {
-    #[serde(rename = "type")]
-    message_type: String,
-    data: InitData,
+  #[serde(rename = "type")]
+  message_type: String,
+  data: InitData,
 }
 
 #[derive(Debug, Serialize)]
 struct InitData {
-    mic: bool,
-    camera: bool,
-    room: String,
-    #[serde(rename = "displayName")]
-    display_name: String,
-    #[serde(rename = "endpointId")]
-    endpoint_id: String,
-    token: String,
+  mic: bool,
+  camera: bool,
+  room: String,
+  #[serde(rename = "displayName")]
+  display_name: String,
+  #[serde(rename = "endpointId")]
+  endpoint_id: String,
+  token: String,
 }
 
 #[derive(Debug, Serialize)]
 struct UpdateEndpointIdMessage {
-    #[serde(rename = "type")]
-    message_type: String,
-    data: UpdateEndpointIdData,
+  #[serde(rename = "type")]
+  message_type: String,
+  data: UpdateEndpointIdData,
 }
 
 #[derive(Debug, Serialize)]
 struct UpdateEndpointIdData {
-    #[serde(rename = "endpointId")]
-    endpoint_id: String,
-    token: String,
-    force: bool,
+  #[serde(rename = "endpointId")]
+  endpoint_id: String,
+  token: String,
+  force: bool,
 }
 
 #[derive(Debug, Serialize)]
 struct StatsUpdateMessage {
-    #[serde(rename = "type")]
-    message_type: String,
-    data: StatsUpdateData,
+  #[serde(rename = "type")]
+  message_type: String,
+  data: StatsUpdateData,
 }
 
 #[derive(Debug, Serialize)]
 struct StatsUpdateData {
   token: String,
   stats: UserStats,
+  outbound_rtp: Vec<RtcOutboundRtpStreamStats>,
 }
 
 #[derive(Debug, Serialize)]
@@ -442,8 +449,10 @@ async fn main_inner() -> Result<()> {
       info!("Found audio element in pipeline, linking...");
       let audio_sink = conference.audio_sink_element().await?;
       audio.link(&audio_sink)?;
-    }
-    else {
+      conference
+        .set_outbound_stats_source_element(MediaType::Audio, &audio)
+        .await?;
+    } else {
       conference.set_muted(MediaType::Audio, true).await?;
     }
 
@@ -451,12 +460,13 @@ async fn main_inner() -> Result<()> {
       info!("Found video element in pipeline, linking...");
       let video_sink = conference.video_sink_element().await?;
       video.link(&video_sink)?;
-    }
-    else {
+      conference
+        .set_outbound_stats_source_element(MediaType::Video, &video)
+        .await?;
+    } else {
       conference.set_muted(MediaType::Video, true).await?;
     }
-  }
-  else {
+  } else {
     conference.set_muted(MediaType::Audio, true).await?;
     conference.set_muted(MediaType::Video, true).await?;
   }
@@ -592,7 +602,7 @@ async fn main_inner() -> Result<()> {
 
     match conference2.subscribe_to_colibri_recv_error(tx).await {
       Ok(()) => {},
-      Err(e) => error!("{:?}", e)
+      Err(e) => error!("{:?}", e),
     }
 
     rx.recv().await;
@@ -620,28 +630,28 @@ async fn main_inner() -> Result<()> {
           Ok(id) => {
             info!("Endpoint ID available: {}", id);
             break id.to_string();
-          }
+          },
           Err(_) => {
             trace!("Waiting for endpoint ID to be available...");
             tokio::time::sleep(Duration::from_millis(100)).await;
-          }
+          },
         }
       };
-      
+
       // Connect to WebSocket
       let ws_url = format!("wss://conference-dev.tellyo.com/notify-ws?token={}", token);
       let (mut ws_sink, mut ws_stream) = match connect_async(ws_url.clone()).await {
         Ok((ws_stream, _)) => {
           info!("Connected to WebSocket at {}", ws_url.clone());
           ws_stream.split()
-        }
+        },
         Err(e) => {
           error!("Failed to connect to WebSocket at {}: {}", ws_url, e);
           tokio::time::sleep(Duration::from_secs(1)).await;
           continue;
-        }
+        },
       };
-      
+
       // Create the JSON message
       let message = InitMessage {
         message_type: "init".to_string(),
@@ -654,7 +664,7 @@ async fn main_inner() -> Result<()> {
           token: token.clone(),
         },
       };
-      
+
       // Serialize to JSON
       let json_message = match serde_json::to_string(&message) {
         Ok(json) => json,
@@ -662,12 +672,12 @@ async fn main_inner() -> Result<()> {
           error!("Failed to serialize init message: {}", e);
           tokio::time::sleep(Duration::from_secs(1)).await;
           continue;
-        }
+        },
       };
-      
+
       // Set up interval for sending messages every second
       let mut interval = interval(Duration::from_secs(1));
-      
+
       // Send initial message
       let message = Message::Text(json_message.clone());
       if let Err(e) = ws_sink.send(message).await {
@@ -675,13 +685,23 @@ async fn main_inner() -> Result<()> {
         tokio::time::sleep(Duration::from_secs(1)).await;
         continue;
       }
-      info!("Sent initial init message with endpoint ID {} to WebSocket", endpoint_id);
-      
+      info!(
+        "Sent initial init message with endpoint ID {} to WebSocket",
+        endpoint_id
+      );
+
       // Keep connection alive and send periodic messages
       loop {
         tokio::select! {
           // Send periodic messages
           _ = interval.tick() => {
+            let outbound_rtp = match conference3.outbound_rtp_stats().await {
+              Ok(stats) => stats,
+              Err(e) => {
+                trace!("Outbound RTP stats are not available yet: {:?}", e);
+                Vec::new()
+              },
+            };
             let message = StatsUpdateMessage {
               message_type: "STATS_UPDATE".to_string(),
               data: StatsUpdateData {
@@ -697,7 +717,8 @@ async fn main_inner() -> Result<()> {
                   status: "active".to_string(),
                   video: true,
                   vssrc: 0,
-                }
+                },
+                outbound_rtp,
               },
             };
             let message = Message::Text(serde_json::to_string(&message).unwrap());
@@ -707,7 +728,7 @@ async fn main_inner() -> Result<()> {
             }
             trace!("Sent update endpoint ID message with endpoint ID {} to WebSocket", endpoint_id);
           }
-          
+
           // Handle incoming messages (optional - just to keep connection alive)
           msg = ws_stream.next() => {
             match msg {
@@ -730,69 +751,72 @@ async fn main_inner() -> Result<()> {
           }
         }
       }
-      
-      info!("WebSocket connection ended for endpoint ID: {}", endpoint_id);
-      
+
+      info!(
+        "WebSocket connection ended for endpoint ID: {}",
+        endpoint_id
+      );
+
       // Wait 1 second before respawning
       tokio::time::sleep(Duration::from_secs(5)).await;
     }
   });
-/*
-  let conference2 = conference.clone();
-  let conference3 = conference.clone();
-  let main_loop__ = main_loop.clone();
+  /*
+    let conference2 = conference.clone();
+    let conference3 = conference.clone();
+    let main_loop__ = main_loop.clone();
 
-  tokio::spawn(async move {
-    let _ = conference2.pipeline_stopped().await;
-    
-    error!("Pipeline stopped, exiting...");
+    tokio::spawn(async move {
+      let _ = conference2.pipeline_stopped().await;
 
-    match timeout(Duration::from_secs(10), conference3.leave()).await {
-      Ok(Ok(_)) => {},
-      Ok(Err(e)) => warn!("Error leaving conference: {:?}", e),
-      Err(_) => warn!("Timed out leaving conference"),
-    }
+      error!("Pipeline stopped, exiting...");
 
-    main_loop__.quit();
-  });
-*/
-/*
-  let bus = conference.pipeline().await.unwrap().bus().context("failed to get pipeline bus")?;
+      match timeout(Duration::from_secs(10), conference3.leave()).await {
+        Ok(Ok(_)) => {},
+        Ok(Err(e)) => warn!("Error leaving conference: {:?}", e),
+        Err(_) => warn!("Timed out leaving conference"),
+      }
 
-  tokio::spawn(async move {
-    let mut stream = bus.stream();
+      main_loop__.quit();
+    });
+  */
+  /*
+    let bus = conference.pipeline().await.unwrap().bus().context("failed to get pipeline bus")?;
 
-    while let Some(msg) = stream.next().await {
-        match msg.view() {
-          gstreamer::MessageView::Error(e) => {
-            if let Some(d) = e.debug() {
-              error!("{}", d);
-            }
-          },
-          gstreamer::MessageView::Warning(e) => {
-            if let Some(d) = e.debug() {
-              warn!("{}", d);
-            }
-          },
-          gstreamer::MessageView::StateChanged(state)
-            if state.current() == gstreamer::State::Null =>
-          {
-            warn!("pipeline state is null. terminating...");
-            //break;
-          },
-          _ => {},
-        }
-    }
+    tokio::spawn(async move {
+      let mut stream = bus.stream();
 
-    match timeout(Duration::from_secs(10), conference__.leave()).await {
-      Ok(Ok(_)) => {},
-      Ok(Err(e)) => warn!("Error leaving conference: {:?}", e),
-      Err(_) => warn!("Timed out leaving conference"),
-    }
+      while let Some(msg) = stream.next().await {
+          match msg.view() {
+            gstreamer::MessageView::Error(e) => {
+              if let Some(d) = e.debug() {
+                error!("{}", d);
+              }
+            },
+            gstreamer::MessageView::Warning(e) => {
+              if let Some(d) = e.debug() {
+                warn!("{}", d);
+              }
+            },
+            gstreamer::MessageView::StateChanged(state)
+              if state.current() == gstreamer::State::Null =>
+            {
+              warn!("pipeline state is null. terminating...");
+              //break;
+            },
+            _ => {},
+          }
+      }
 
-    main_loop__.quit();
-  });
-*/
+      match timeout(Duration::from_secs(10), conference__.leave()).await {
+        Ok(Ok(_)) => {},
+        Ok(Err(e)) => warn!("Error leaving conference: {:?}", e),
+        Err(_) => warn!("Timed out leaving conference"),
+      }
+
+      main_loop__.quit();
+    });
+  */
   task::spawn_blocking(move || main_loop.run()).await?;
 
   Ok(())

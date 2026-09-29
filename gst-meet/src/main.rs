@@ -514,14 +514,14 @@ async fn main_inner() -> Result<()> {
     })
     .await;
 
-  conference
-    .on_colibri_message(move |_conference, message| {
-      Box::pin(async move {
-        info!("Colibri message: {:?}", message);
-        Ok(())
-      })
-    })
-    .await;
+  // conference
+  //   .on_colibri_message(move |_conference, message| {
+  //     Box::pin(async move {
+  //       info!("Colibri message: {:?}", message);
+  //       Ok(())
+  //     })
+  //   })
+  //   .await;
 
   conference
     .set_pipeline_state(gstreamer::State::Playing)

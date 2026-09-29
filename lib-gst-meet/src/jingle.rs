@@ -1,4 +1,10 @@
-use std::{collections::HashMap, fmt, net::SocketAddr};
+use std::{
+  collections::HashMap,
+  fmt,
+  net::SocketAddr,
+  sync::{Arc, Mutex},
+  time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures::stream::StreamExt as _;
@@ -9,11 +15,10 @@ use glib::{
 use gstreamer::{
   prelude::{
     ElementExt as _, ElementExtManual as _, GObjectExtManualGst as _, GstBinExt as _,
-    GstBinExtManual as _, GstObjectExt as _, PadExt as _,
+    GstBinExtManual as _, GstObjectExt as _, PadExt as _, PadExtManual as _,
   },
   Bin, GhostPad,
 };
-#[cfg(feature = "log-rtp")]
 use gstreamer_rtp::RTPBuffer;
 use gstreamer_rtp::{prelude::RTPHeaderExtensionExt as _, RTPHeaderExtension};
 use jitsi_xmpp_parsers::{
@@ -46,6 +51,7 @@ use xmpp_parsers::{
 use crate::{
   colibri::ColibriChannel,
   conference::JitsiConference,
+  rtc_stats::RtcOutboundRtpStreamStats,
   source::{MediaType, Source},
   util::generate_id,
 };
@@ -82,8 +88,7 @@ impl Codec {
   fn is_rtx(&self, rtx_pt: u8) -> bool {
     if let Some(pt) = self.rtx_pt {
       pt == rtx_pt
-    }
-    else {
+    } else {
       false
     }
   }
@@ -154,10 +159,158 @@ struct ParsedRtpDescription {
   video_hdrext_transport_cc: Option<u16>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct OutboundStatsSourceInfo {
+  encoder_implementation: Option<String>,
+  target_bitrate: Option<u64>,
+}
+
+impl OutboundStatsSourceInfo {
+  pub(crate) fn from_element(element: &gstreamer::Element) -> Self {
+    Self {
+      encoder_implementation: element.factory().map(|factory| factory.name().to_string()),
+      target_bitrate: read_target_bitrate(element),
+    }
+  }
+}
+
+fn read_target_bitrate(element: &gstreamer::Element) -> Option<u64> {
+  for property_name in ["target-bitrate", "bitrate"] {
+    if element.find_property(property_name).is_none() {
+      continue;
+    }
+
+    let value = element.property_value(property_name);
+    if let Ok(value) = value.get::<u64>() {
+      return Some(value);
+    }
+    if let Ok(value) = value.get::<u32>() {
+      return Some(u64::from(value));
+    }
+    if let Ok(value) = value.get::<i64>() {
+      return value.try_into().ok();
+    }
+    if let Ok(value) = value.get::<i32>() {
+      return value.try_into().ok();
+    }
+  }
+
+  None
+}
+
+fn source_stat_by_ssrc<'a>(
+  source_stats: &'a [gstreamer::Structure],
+  ssrc: u32,
+) -> Option<&'a gstreamer::Structure> {
+  source_stats
+    .iter()
+    .find(|stat| stat.get::<u32>("ssrc").ok() == Some(ssrc))
+}
+
+fn apply_rtp_source_stats(
+  stats: &mut RtcOutboundRtpStreamStats,
+  source_stat: &gstreamer::Structure,
+) {
+  apply_rtp_source_stat_values(
+    stats,
+    source_stat.get("octets-sent").ok(),
+    source_stat.get("packets-sent").ok(),
+    source_stat.get("recv-nack-count").ok(),
+  );
+}
+
+fn apply_rtp_source_stat_values(
+  stats: &mut RtcOutboundRtpStreamStats,
+  bytes_sent: Option<u64>,
+  packets_sent: Option<u64>,
+  nack_count: Option<u32>,
+) {
+  stats.bytes_sent = bytes_sent;
+  stats.packets_sent = packets_sent;
+  stats.nack_count = nack_count;
+}
+
+fn payloader_sink_dimensions(element: &gstreamer::Element) -> Option<(Option<u32>, Option<u32>)> {
+  let caps = element.static_pad("sink")?.current_caps()?;
+  let structure = caps.structure(0)?;
+  let width = structure
+    .get::<u32>("width")
+    .ok()
+    .or_else(|| structure.get::<i32>("width").ok()?.try_into().ok());
+  let height = structure
+    .get::<u32>("height")
+    .ok()
+    .or_else(|| structure.get::<i32>("height").ok()?.try_into().ok());
+
+  if width.is_some() || height.is_some() {
+    Some((width, height))
+  } else {
+    None
+  }
+}
+
+#[derive(Debug, Clone, Default)]
+struct OutboundRtpStreamCounters {
+  header_bytes_sent: u64,
+  frames_sent: u32,
+  frames_in_current_second: u32,
+  current_second_started_at: Option<Instant>,
+  frames_per_second: Option<u32>,
+}
+
+impl OutboundRtpStreamCounters {
+  fn observe_packet(&mut self, header_bytes: u64, marker: bool) {
+    self.header_bytes_sent = self.header_bytes_sent.saturating_add(header_bytes);
+
+    if !marker {
+      return;
+    }
+
+    self.frames_sent = self.frames_sent.saturating_add(1);
+
+    let now = Instant::now();
+    if let Some(started_at) = self.current_second_started_at {
+      if now.duration_since(started_at) >= Duration::from_secs(1) {
+        self.frames_per_second = Some(self.frames_in_current_second);
+        self.frames_in_current_second = 1;
+        self.current_second_started_at = Some(now);
+      } else {
+        self.frames_in_current_second = self.frames_in_current_second.saturating_add(1);
+      }
+    } else {
+      self.current_second_started_at = Some(now);
+      self.frames_in_current_second = 1;
+    }
+  }
+}
+
+#[derive(Debug, Default)]
+struct OutboundRtpStatsCollector {
+  streams: HashMap<u32, OutboundRtpStreamCounters>,
+}
+
+impl OutboundRtpStatsCollector {
+  fn observe_packet(&mut self, ssrc: u32, header_bytes: u64, marker: bool) {
+    self
+      .streams
+      .entry(ssrc)
+      .or_default()
+      .observe_packet(header_bytes, marker);
+  }
+}
+
 pub(crate) struct JingleSession {
   pipeline: gstreamer::Pipeline,
   audio_sink_element: gstreamer::Element,
   video_sink_element: gstreamer::Element,
+  audio_ssrc: u32,
+  video_ssrc: u32,
+  video_rtx_ssrc: Option<u32>,
+  outbound_stats_collector: Arc<Mutex<OutboundRtpStatsCollector>>,
+  outbound_audio_source_info: Option<OutboundStatsSourceInfo>,
+  outbound_video_source_info: Option<OutboundStatsSourceInfo>,
+  outbound_audio_active: bool,
+  outbound_video_active: bool,
   pub(crate) remote_ssrc_map: HashMap<u32, Source>,
   _ice_agent: nice::Agent,
   pub(crate) accept_iq_id: Option<String>,
@@ -184,6 +337,101 @@ impl JingleSession {
 
   pub(crate) fn video_sink_element(&self) -> gstreamer::Element {
     self.video_sink_element.clone()
+  }
+
+  pub(crate) fn set_outbound_stats_source_info(
+    &mut self,
+    media_type: MediaType,
+    source_info: OutboundStatsSourceInfo,
+  ) {
+    match media_type {
+      MediaType::Audio => self.outbound_audio_source_info = Some(source_info),
+      MediaType::Video => self.outbound_video_source_info = Some(source_info),
+    }
+  }
+
+  pub(crate) fn set_outbound_stats_active(&mut self, media_type: MediaType, active: bool) {
+    match media_type {
+      MediaType::Audio => self.outbound_audio_active = active,
+      MediaType::Video => self.outbound_video_active = active,
+    }
+  }
+
+  pub(crate) fn outbound_rtp_stats(&self) -> Result<Vec<RtcOutboundRtpStreamStats>> {
+    let timestamp = SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .context("system clock is before unix epoch")?
+      .as_secs_f64()
+      * 1000.0;
+
+    let source_stats = self.outbound_source_stats();
+    let collector = self.outbound_stats_collector.lock().ok();
+
+    let mut audio = RtcOutboundRtpStreamStats::new(self.audio_ssrc, "audio", timestamp);
+    audio.active = Some(self.outbound_audio_active);
+    if let Some(source_stat) = source_stat_by_ssrc(&source_stats, self.audio_ssrc) {
+      apply_rtp_source_stats(&mut audio, source_stat);
+    }
+    if let Some(counters) = collector
+      .as_ref()
+      .and_then(|collector| collector.streams.get(&self.audio_ssrc))
+    {
+      audio.header_bytes_sent = Some(counters.header_bytes_sent);
+    }
+    if let Some(source_info) = &self.outbound_audio_source_info {
+      audio.encoder_implementation = source_info.encoder_implementation.clone();
+      audio.target_bitrate = source_info.target_bitrate;
+    }
+
+    let mut video = RtcOutboundRtpStreamStats::new(self.video_ssrc, "video", timestamp);
+    video.active = Some(self.outbound_video_active);
+    if let Some(source_stat) = source_stat_by_ssrc(&source_stats, self.video_ssrc) {
+      apply_rtp_source_stats(&mut video, source_stat);
+      video.fir_count = source_stat.get("recv-fir-count").ok();
+      video.pli_count = source_stat.get("recv-pli-count").ok();
+    }
+    if let Some(counters) = collector
+      .as_ref()
+      .and_then(|collector| collector.streams.get(&self.video_ssrc))
+    {
+      video.header_bytes_sent = Some(counters.header_bytes_sent);
+      video.frames_sent = Some(counters.frames_sent);
+      video.frames_per_second = counters.frames_per_second;
+    }
+    if let Some((width, height)) = payloader_sink_dimensions(&self.video_sink_element) {
+      video.frame_width = width;
+      video.frame_height = height;
+    }
+    if let Some(source_info) = &self.outbound_video_source_info {
+      video.encoder_implementation = source_info.encoder_implementation.clone();
+      video.target_bitrate = source_info.target_bitrate;
+    }
+    if let Some(rtx_ssrc) = self.video_rtx_ssrc {
+      video.rtx_ssrc = Some(rtx_ssrc);
+      if let Some(rtx_source_stat) = source_stat_by_ssrc(&source_stats, rtx_ssrc) {
+        video.retransmitted_bytes_sent = rtx_source_stat.get("octets-sent").ok();
+        video.retransmitted_packets_sent = rtx_source_stat.get("packets-sent").ok();
+      }
+    }
+
+    Ok(vec![audio, video])
+  }
+
+  fn outbound_source_stats(&self) -> Vec<gstreamer::Structure> {
+    self
+      .pipeline
+      .by_name("rtpbin")
+      .map(|rtpbin| rtpbin.emit_by_name("get-session", &[&0u32]))
+      .map(|rtpsession: gstreamer::Element| rtpsession.property("stats"))
+      .and_then(|stats: gstreamer::Structure| stats.get("source-stats").ok())
+      .and_then(|stats: glib::ValueArray| {
+        stats
+          .into_iter()
+          .map(|v| v.get())
+          .collect::<Result<_, _>>()
+          .ok()
+      })
+      .unwrap_or_default()
   }
 
   pub(crate) fn pause_all_sinks(&self) {
@@ -234,13 +482,11 @@ impl JingleSession {
       for hdrext in description.hdrexts.iter() {
         if hdrext.uri == RTP_HDREXT_SSRC_AUDIO_LEVEL {
           audio_hdrext_ssrc_audio_level = Some(hdrext.id);
-        }
-        else if hdrext.uri == RTP_HDREXT_TRANSPORT_CC {
+        } else if hdrext.uri == RTP_HDREXT_TRANSPORT_CC {
           audio_hdrext_transport_cc = Some(hdrext.id);
         }
       }
-    }
-    else if description.media == "video" {
+    } else if description.media == "video" {
       for pt in description.payload_types.iter() {
         // We don’t support any static codec, so name MUST be set.
         if let Some(name) = &pt.name {
@@ -317,8 +563,7 @@ impl JingleSession {
           video_hdrext_transport_cc = Some(hdrext.id);
         }
       }
-    }
-    else {
+    } else {
       debug!("skipping media: {}", description.media);
       return Ok(None);
     }
@@ -345,8 +590,7 @@ impl JingleSession {
           participant_id: participant_id_for_owner(owner)?,
           media_type: if description.media == "audio" {
             MediaType::Audio
-          }
-          else {
+          } else {
             MediaType::Video
           },
         },
@@ -385,8 +629,7 @@ impl JingleSession {
       .await
       .context("failed to resolve STUN server hostname")?
       .next()
-    }
-    else {
+    } else {
       None
     };
     debug!("STUN address: {:?}", stun_addr);
@@ -630,8 +873,7 @@ impl JingleSession {
                 if let Some(hdrext) = audio_hdrext_transport_cc {
                   caps = caps.field(&format!("extmap-{}", hdrext), RTP_HDREXT_TRANSPORT_CC);
                 }
-              }
-              else {
+              } else {
                 // A video codec, as the only audio codec we support is Opus.
                 caps = caps
                   .field("media", "video")
@@ -643,8 +885,7 @@ impl JingleSession {
                 }
               }
               return Ok::<_, anyhow::Error>(Some(caps.build()));
-            }
-            else if codec.is_rtx(pt) {
+            } else if codec.is_rtx(pt) {
               caps = caps
                 .field("media", "video")
                 .field("clock-rate", 90000)
@@ -723,6 +964,11 @@ impl JingleSession {
           .map(|rtx_pt| (codec.pt.to_string(), rtx_pt as u32))
       })
       .collect();
+    let video_rtx_ssrc_for_stats = if pts.is_empty() {
+      None
+    } else {
+      Some(video_rtx_ssrc)
+    };
     {
       let pts = pts.clone();
       rtpbin.connect("request-aux-sender", false, move |values| {
@@ -864,8 +1110,7 @@ impl JingleSession {
                   maybe_sink_element,
                   maybe_participant_bin,
                 )
-              }
-              else {
+              } else {
                 debug!("source is owned by JVB");
                 (None, None, None)
               };
@@ -894,8 +1139,7 @@ impl JingleSession {
                   .find(|codec| codec.is(pt));
                 if let Some(codec) = codec {
                   gstreamer::ElementFactory::make(codec.depayloader_name()).build()?
-                }
-                else {
+                } else {
                   bail!("received audio with unsupported PT {}", pt);
                 }
               },
@@ -906,8 +1150,7 @@ impl JingleSession {
                   .find(|codec| codec.is(pt));
                 if let Some(codec) = codec {
                   gstreamer::ElementFactory::make(codec.depayloader_name()).build()?
-                }
-                else {
+                } else {
                   bail!("received video with unsupported PT {}", pt);
                 }
               },
@@ -962,8 +1205,7 @@ impl JingleSession {
                 if let Some(codec) = codec {
                   gstreamer::ElementFactory::make(codec.decoder_name()).build()?
                   // TODO: fec
-                }
-                else {
+                } else {
                   bail!("received audio with unsupported PT {}", pt);
                 }
               },
@@ -980,8 +1222,7 @@ impl JingleSession {
                     "GST_VIDEO_DECODER_REQUEST_SYNC_POINT_CORRUPT_OUTPUT",
                   );
                   decoder
-                }
-                else {
+                } else {
                   bail!("received video with unsupported PT {}", pt);
                 }
               },
@@ -1083,8 +1324,7 @@ impl JingleSession {
                 "linked {}/{:?} to new pad in recv pipeline",
                 participant_id, source.media_type
               );
-            }
-            else if let Some(participant_bin) = maybe_participant_bin {
+            } else if let Some(participant_bin) = maybe_participant_bin {
               let sink_pad_name = match source.media_type {
                 MediaType::Audio => "audio",
                 MediaType::Video => "video",
@@ -1097,8 +1337,7 @@ impl JingleSession {
                   "linked {}/{:?} to recv participant pipeline",
                   participant_id, source.media_type
                 );
-              }
-              else {
+              } else {
                 warn!(
                   "no {} sink pad on {} participant bin in recv participant pipeline",
                   sink_pad_name, participant_id
@@ -1112,8 +1351,7 @@ impl JingleSession {
             );
 
             Ok::<_, anyhow::Error>(())
-          }
-          else {
+          } else {
             Ok(())
           }
         };
@@ -1129,8 +1367,7 @@ impl JingleSession {
       let audio_sink_element = gstreamer::ElementFactory::make(opus.payloader_name()).build()?;
       audio_sink_element.set_property("pt", opus.pt as u32);
       audio_sink_element
-    }
-    else {
+    } else {
       bail!("no opus payload type in jingle session-initiate");
     };
     audio_sink_element.set_property("min-ptime", 10i64 * 1000 * 1000);
@@ -1158,8 +1395,7 @@ impl JingleSession {
           },
         }
       });
-    }
-    else {
+    } else {
       debug!("audio payloader: no rtp header extension support");
     }
     pipeline.add(&audio_sink_element)?;
@@ -1171,13 +1407,11 @@ impl JingleSession {
       element.set_property("pt", codec.pt as u32);
       if codec.name == CodecName::H264 {
         element.set_property_from_str("aggregate-mode", "zero-latency");
-      }
-      else if codec.name == CodecName::Vp8 || codec.name == CodecName::Vp9 {
+      } else if codec.name == CodecName::Vp8 || codec.name == CodecName::Vp9 {
         element.set_property_from_str("picture-id-mode", "15-bit");
       }
       element
-    }
-    else {
+    } else {
       bail!("unsupported video codec: {}", codec_name);
     };
 
@@ -1185,15 +1419,13 @@ impl JingleSession {
       match pspec.value_type() {
         glib::Type::I64 => {
           video_sink_element.set_property("ssrc", video_ssrc as i64);
-        }
+        },
         glib::Type::U32 => {
           video_sink_element.set_property("ssrc", video_ssrc);
-        }
+        },
         _ => {
-          warn!(
-              "Unsupported ssrc type of the rtp payloader (expected i64 or u32)"
-          );
-        }
+          warn!("Unsupported ssrc type of the rtp payloader (expected i64 or u32)");
+        },
       }
     }
 
@@ -1220,8 +1452,7 @@ impl JingleSession {
           },
         }
       });
-    }
-    else {
+    } else {
       debug!("video payloader: no rtp header extension support");
     }
     pipeline.add(&video_sink_element)?;
@@ -1238,6 +1469,8 @@ impl JingleSession {
     debug!("linking rtpfunnel -> rtpbin");
     rtpfunnel.link_pads(None, &rtpbin, Some("send_rtp_sink_0"))?;
 
+    let outbound_stats_collector = Arc::new(Mutex::new(OutboundRtpStatsCollector::default()));
+
     let rtp_recv_identity = gstreamer::ElementFactory::make("identity").build()?;
     pipeline.add(&rtp_recv_identity)?;
     let rtcp_recv_identity = gstreamer::ElementFactory::make("identity").build()?;
@@ -1246,6 +1479,27 @@ impl JingleSession {
     pipeline.add(&rtp_send_identity)?;
     let rtcp_send_identity = gstreamer::ElementFactory::make("identity").build()?;
     pipeline.add(&rtcp_send_identity)?;
+
+    if let Some(src_pad) = rtp_send_identity.static_pad("src") {
+      let collector = outbound_stats_collector.clone();
+      let _ = src_pad.add_probe(gstreamer::PadProbeType::BUFFER, move |_, info| {
+        if let Some(buffer) = info.buffer() {
+          if let Ok(rtp_buffer) = RTPBuffer::from_buffer_readable(buffer) {
+            let header_bytes = buffer
+              .size()
+              .saturating_sub(rtp_buffer.payload_size() as usize)
+              as u64;
+            if let Ok(mut collector) = collector.lock() {
+              collector.observe_packet(rtp_buffer.ssrc(), header_bytes, rtp_buffer.is_marker());
+            }
+          }
+        }
+
+        gstreamer::PadProbeReturn::Ok
+      });
+    } else {
+      warn!("rtp_send_identity has no src pad; outbound RTP packet counters disabled");
+    }
 
     #[cfg(feature = "log-rtp")]
     {
@@ -1380,12 +1634,10 @@ impl JingleSession {
           let mut pt = PayloadType::new(codec.pt, "opus".to_owned(), 48000, 2);
           pt.rtcp_fbs = codec.rtcp_fbs.clone();
           vec![pt]
-        }
-        else {
+        } else {
           bail!("no opus payload type in jingle session-initiate");
         }
-      }
-      else {
+      } else {
         let mut pts = vec![];
         let codec_name = conference.config.video_codec.as_str();
         let codec = codecs.iter().find(|codec| codec.is_codec(codec_name));
@@ -1407,8 +1659,7 @@ impl JingleSession {
               .collect();
             pts.push(rtx_pt);
           }
-        }
-        else {
+        } else {
           bail!("unsupported video codec: {}", codec_name);
         }
         pts
@@ -1423,8 +1674,7 @@ impl JingleSession {
 
       description.ssrc = Some(if initiate_content.name.0 == "audio" {
         audio_ssrc.to_string()
-      }
-      else {
+      } else {
         video_ssrc.to_string()
       });
 
@@ -1434,8 +1684,7 @@ impl JingleSession {
           Some(format!("{endpoint_id}-a0")),
           None,
         )]
-      }
-      else {
+      } else {
         let source_name = format!("{endpoint_id}-v0");
         vec![
           jingle_ssma::Source::new(video_ssrc, Some(source_name.clone()), Some("camera".into())),
@@ -1452,8 +1701,7 @@ impl JingleSession {
 
       description.ssrc_groups = if initiate_content.name.0 == "audio" {
         vec![]
-      }
-      else {
+      } else {
         vec![jingle_ssma::Group {
           semantics: Semantics::Fid,
           sources: vec![
@@ -1475,8 +1723,7 @@ impl JingleSession {
             .hdrexts
             .push(RtpHdrext::new(hdrext, RTP_HDREXT_TRANSPORT_CC.to_owned()));
         }
-      }
-      else if initiate_content.name.0 == "video" {
+      } else if initiate_content.name.0 == "video" {
         if let Some(hdrext) = video_hdrext_transport_cc {
           description
             .hdrexts
@@ -1541,6 +1788,14 @@ impl JingleSession {
       pipeline,
       audio_sink_element,
       video_sink_element,
+      audio_ssrc,
+      video_ssrc,
+      video_rtx_ssrc: video_rtx_ssrc_for_stats,
+      outbound_stats_collector,
+      outbound_audio_source_info: None,
+      outbound_video_source_info: None,
+      outbound_audio_active: true,
+      outbound_video_active: true,
       remote_ssrc_map,
       _ice_agent: ice_agent,
       accept_iq_id: Some(accept_iq_id),
@@ -1570,8 +1825,7 @@ impl JingleSession {
               participant_id: participant_id_for_owner(owner)?,
               media_type: if description.media == "audio" {
                 MediaType::Audio
-              }
-              else {
+              } else {
                 MediaType::Video
               },
             },
@@ -1586,17 +1840,30 @@ impl JingleSession {
 fn participant_id_for_owner(owner: String) -> Result<Option<String>> {
   if owner == "jvb" {
     Ok(None)
-  }
-  else {
+  } else {
     Ok(Some(if owner.contains('/') {
       owner
         .split('/')
         .nth(1)
         .context("invalid ssrc-info owner")?
         .to_owned()
-    }
-    else {
+    } else {
       owner
     }))
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn applies_outbound_rtp_source_stat_values() {
+    let mut stats = RtcOutboundRtpStreamStats::new(42, "audio", 1.0);
+    apply_rtp_source_stat_values(&mut stats, Some(12_345), Some(678), Some(9));
+
+    assert_eq!(stats.bytes_sent, Some(12_345));
+    assert_eq!(stats.packets_sent, Some(678));
+    assert_eq!(stats.nack_count, Some(9));
   }
 }

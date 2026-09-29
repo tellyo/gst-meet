@@ -2,6 +2,7 @@ pub mod colibri;
 mod conference;
 mod jingle;
 mod pinger;
+mod rtc_stats;
 mod source;
 mod stanza_filter;
 mod tls;
@@ -12,6 +13,7 @@ pub use xmpp_parsers;
 
 pub use crate::{
   conference::{Feature, JitsiConference, JitsiConferenceConfig, Participant},
+  rtc_stats::{QualityLimitationDurations, RtcOutboundRtpStreamStats},
   source::MediaType,
   stanza_filter::StanzaFilter,
   xmpp::connection::{Authentication, Connection},
